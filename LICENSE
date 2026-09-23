@@ -1,0 +1,167 @@
+DEFENSEOPS SOURCE-AVAILABLE LICENSE
+Version 1.0 — 2026
+
+Copyright (c) 2026 Hendrawan Aprillia Ashari, S.T., M.Kom.
+
+1. PURPOSE
+
+DefenseOps is made available as source-available software to encourage
+learning, research, development, collaboration, and use in personal and
+internal organizational environments.
+
+This License grants broad rights to use, study, modify, and develop the
+software, while reserving proprietary and closed-source commercial
+distribution rights to the Copyright Holder.
+
+2. DEFINITIONS
+
+"Software" means the DefenseOps source code, documentation, configuration,
+scripts, and other materials distributed under this License.
+
+"Copyright Holder" means Hendrawan Aprillia Ashari, S.T., M.Kom.
+
+"Derivative Work" means a modified version of the Software or a work that
+substantially incorporates or is derived from the Software.
+
+"Proprietary Product" means a product, service, appliance, platform, or
+software distribution derived from or substantially incorporating the
+Software where the relevant source code or modifications are not made
+available to recipients under this License or another license permitting
+equivalent source access.
+
+"Commercial License" means a separate written license granted by the
+Copyright Holder authorizing proprietary, closed-source, or other
+commercial uses that are restricted by this License.
+
+3. PERMITTED USES
+
+Subject to the terms of this License, you are granted a worldwide,
+non-exclusive, royalty-free license to:
+
+a. use the Software for personal, educational, research, testing, and
+   internal organizational purposes;
+
+b. study and inspect the source code;
+
+c. copy the Software;
+
+d. modify the Software;
+
+e. create Derivative Works;
+
+f. create and maintain forks of the Software; and
+
+g. share the Software and source-code modifications with others, provided
+   that such distribution remains subject to this License.
+
+4. PROPRIETARY AND CLOSED-SOURCE USE
+
+The rights granted by Section 3 do NOT include the right to create,
+distribute, sell, sublicense, or otherwise commercialize a Proprietary
+Product based on or substantially incorporating the Software.
+
+Any person or organization wishing to:
+
+a. distribute a Proprietary Product derived from the Software;
+
+b. distribute closed-source modifications of the Software as a product;
+
+c. incorporate the Software into a proprietary commercial product;
+
+d. sell, license, or otherwise commercially distribute a closed-source
+   Derivative Work; or
+
+e. use the Software as a substantial component of a proprietary software
+   platform or appliance;
+
+must obtain a separate Commercial License from the Copyright Holder before
+such use.
+
+5. OPEN DEVELOPMENT
+
+This License does not prevent development of Derivative Works or forks.
+Derivative Works may be developed and distributed as source code under this
+License, provided that the recipient receives the rights and restrictions
+specified by this License.
+
+Nothing in this License requires a contributor to assign copyright in their
+own independent contributions to the Copyright Holder.
+
+6. COPYRIGHT AND ATTRIBUTION
+
+The Software and its original components remain protected by applicable
+copyright law.
+
+You must retain existing copyright notices, this License, and attribution
+information in copies or substantial portions of the Software.
+
+You may add attribution for your own modifications, but you may not remove
+or misrepresent the original copyright attribution.
+
+7. TRADEMARKS
+
+This License does not grant permission to use the names, logos, trademarks,
+service marks, or branding of DefenseOps, NR Technology, or the Copyright
+Holder except where such use is necessary to accurately describe the
+Software or is otherwise permitted by applicable law.
+
+Any separate trademark rights remain reserved.
+
+8. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+9. NO GRANT OF PROPRIETARY COMMERCIAL RIGHTS
+
+Except for the permissions expressly granted by this License, all rights
+are reserved by the Copyright Holder.
+
+A separate Commercial License may grant additional rights, permissions,
+support arrangements, or other commercial terms.
+
+10. TERMINATION
+
+The rights granted under this License terminate automatically if you
+materially violate its terms.
+
+Upon termination, you must cease the activities for which this License no
+longer grants permission, except to the extent applicable law provides
+otherwise.
+
+11. CHANGES TO THIS LICENSE
+
+Future versions of DefenseOps may be distributed under a different version
+of this License or under another license selected by the Copyright Holder.
+
+Unless explicitly stated otherwise, each released version remains governed
+by the license included with that version.
+
+12. CONTACT FOR COMMERCIAL LICENSING
+
+Requests for permission to create, distribute, or commercialize a
+Proprietary Product based on DefenseOps should be directed to the Copyright
+Holder.
+
+Copyright Holder:
+Hendrawan Aprillia Ashari, S.T., M.Kom.
+
+Project:
+DefenseOps — Security Operations & Defense Platform
+
+Brand:
+NR Technology
+
+13. ACCEPTANCE
+
+By exercising rights granted by this License, you agree to be bound by its
+terms.
+
+If you do not agree to these terms, you may not exercise the rights granted
+by this License.
