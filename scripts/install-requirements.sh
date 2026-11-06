@@ -184,7 +184,7 @@ install_base_packages() {
     env DEBIAN_FRONTEND=noninteractive apt-get install -y \
         ca-certificates curl wget gnupg lsb-release jq git unzip zip tar gzip \
         openssl rsync logrotate chrony vim htop net-tools iproute2 dnsutils \
-        iputils-ping procps util-linux software-properties-common python3 \
+        iputils-ping procps util-linux findutils software-properties-common python3 \
         python3-yaml
     ok "Paket dasar terpasang."
 }
@@ -320,8 +320,69 @@ prepare_wazuh_source() {
     ok "Source Wazuh ${WAZUH_VERSION} tersedia."
 }
 
+build_certificate_generator_image() {
+    local builder_dir="${WAZUH_ROOT}/certs-generator"
+    local dockerfile="${builder_dir}/Dockerfile"
+
+    install -d -m 0755 "$builder_dir"
+    cat > "$dockerfile" <<'DOCKERFILE'
+FROM wazuh/wazuh-certs-generator:0.0.5
+USER root
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y --no-install-recommends findutils \
+        && rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache findutils; \
+    elif command -v dnf >/dev/null 2>&1; then \
+        dnf install -y findutils && dnf clean all; \
+    elif command -v microdnf >/dev/null 2>&1; then \
+        microdnf install -y findutils && microdnf clean all; \
+    elif command -v yum >/dev/null 2>&1; then \
+        yum install -y findutils && yum clean all; \
+    else \
+        echo "No supported package manager found to install findutils" >&2; \
+        exit 1; \
+    fi
+DOCKERFILE
+
+    log "Membangun certificate-generator image dengan findutils..."
+    docker build --pull=false \
+        --tag wazuh/wazuh-certs-generator:0.0.5 \
+        "$builder_dir"
+    ok "Certificate-generator image siap (find tersedia)."
+}
+
+repair_wazuh_certificate_permissions() {
+    local cert_dir="${WAZUH_CONFIG}/wazuh_indexer_ssl_certs"
+
+    [[ -d "$cert_dir" ]] || die "Direktori sertifikat tidak ditemukan: ${cert_dir}"
+    [[ -s "${cert_dir}/root-ca.pem" ]] || die "Root CA Wazuh tidak ditemukan atau kosong."
+
+    # The upstream certificate tool uses find to set ownership and modes.
+    # Repair these on the host as a safety net and validate required files.
+    local cert
+    for cert in \
+        admin.pem admin-key.pem root-ca.pem root-ca.key \
+        wazuh.indexer.pem wazuh.indexer-key.pem \
+        wazuh.manager.pem wazuh.manager-key.pem \
+        wazuh.dashboard.pem wazuh.dashboard-key.pem; do
+        [[ -s "${cert_dir}/${cert}" ]] || die "Sertifikat wajib ${cert} tidak ditemukan atau kosong."
+    done
+
+    chown -R 1000:1000 "$cert_dir"
+    find "$cert_dir" -type d -exec chmod 0500 {} +
+    find "$cert_dir" -type f \( -name '*-key.pem' -o -name '*.key' \) -exec chmod 0400 {} +
+    find "$cert_dir" -type f \( -name '*.pem' ! -name '*-key.pem' \) -exec chmod 0444 {} +
+
+    ok "Sertifikat Wazuh tervalidasi; ownership dan permission diperbaiki."
+}
+
 seed_wazuh_configuration() {
     local upstream_config="${WAZUH_SOURCE}/single-node/config"
+    local upstream_cert_dir="${upstream_config}/wazuh_indexer_ssl_certs"
+    local target_cert_dir="${WAZUH_CONFIG}/wazuh_indexer_ssl_certs"
+
     [[ -d "$upstream_config" ]] || die "Direktori konfigurasi upstream tidak ditemukan."
 
     if [[ ! -f "${WAZUH_CONFIG}/wazuh_indexer/internal_users.yml" ]]; then
@@ -331,20 +392,22 @@ seed_wazuh_configuration() {
         log "Konfigurasi Wazuh yang sudah ada dipertahankan."
     fi
 
-    if [[ ! -f "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs/root-ca.pem" ]]; then
+    if [[ ! -s "${target_cert_dir}/root-ca.pem" ]]; then
         log "Membuat sertifikat TLS self-signed menggunakan certificate generator resmi Wazuh..."
+        build_certificate_generator_image
         (
             cd "${WAZUH_SOURCE}/single-node"
-            docker compose -f generate-indexer-certs.yml run --rm generator
+            docker compose -f generate-indexer-certs.yml run --rm --pull never generator
         )
-        install -d -m 0750 "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs"
-        cp -a "${WAZUH_SOURCE}/single-node/config/wazuh_indexer_ssl_certs/." \
-            "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs/"
+        install -d -m 0750 "$target_cert_dir"
+        if [[ -d "$upstream_cert_dir" ]]; then
+            cp -a "${upstream_cert_dir}/." "${target_cert_dir}/"
+        fi
     else
-        log "Sertifikat Wazuh yang sudah ada dipertahankan."
+        log "Sertifikat Wazuh yang sudah ada dipertahankan; memeriksa permission dan ownership."
     fi
 
-    [[ -f "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs/root-ca.pem" ]] || die "Root CA Wazuh tidak berhasil dibuat."
+    repair_wazuh_certificate_permissions
     ok "Konfigurasi dan sertifikat Wazuh tersedia."
 }
 
@@ -398,12 +461,33 @@ CREDS
 
 generate_indexer_hash() {
     local password="$1" output hash
-    output="$(printf '%s\n' "$password" | docker run --rm -i \
-        --entrypoint /bin/bash "wazuh/wazuh-indexer:${WAZUH_VERSION}" \
-        -c '/usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh' 2>/dev/null)" \
-        || die "Gagal membuat hash password Indexer."
-    hash="$(printf '%s\n' "$output" | grep -Eo '\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}' | tail -n 1 || true)"
-    [[ -n "$hash" ]] || die "Hash bcrypt tidak ditemukan dari hash.sh. Output: ${output}"
+
+    # OpenSearch hash.sh expects -p <password>; it does not read from stdin.
+    # The password is passed through an environment variable to avoid exposing
+    # it in the docker command-line arguments.
+    output="$(docker run --rm \
+        --entrypoint /bin/bash \
+        -e "HASH_PASSWORD=${password}" \
+        -e JAVA_HOME=/usr/share/wazuh-indexer/jdk \
+        -e OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk \
+        "wazuh/wazuh-indexer:${WAZUH_VERSION}" \
+        -c '/usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "$HASH_PASSWORD"' 2>&1)" \
+        || {
+            err "Perintah hash.sh gagal. Output:"
+            printf '%s\n' "$output" >&2
+            die "Gagal membuat hash password Indexer."
+        }
+
+    hash="$(printf '%s\n' "$output" |
+        grep -Eo '\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}' |
+        tail -n 1 || true)"
+
+    [[ -n "$hash" ]] || {
+        err "Output hash.sh tidak berisi hash bcrypt yang valid:"
+        printf '%s\n' "$output" >&2
+        die "Hash bcrypt tidak ditemukan."
+    }
+
     printf '%s' "$hash"
 }
 
