@@ -275,43 +275,60 @@ Automated response harus dirancang secara hati-hati untuk menghindari false posi
 
 ## Repository Structure
 
-Struktur awal repository:
-
 ```text
 DefenseOps/
 ├── README.md
 ├── LICENSE
+├── COMMERCIAL-LICENSE.md
 ├── CHANGELOG.md
 ├── .gitignore
-│
+├── install.sh
 ├── docs/
-│   ├── architecture.md
-│   └── installation.md
-│
+│   ├── architecture/
+│   ├── deployment/
+│   ├── operations/
+│   └── security/
 ├── scripts/
-│   ├── install.sh
+│   ├── install-requirements.sh
+│   ├── check-server.sh
+│   ├── install-dependencies.sh
 │   ├── configure.sh
 │   └── healthcheck.sh
-│
 ├── config/
-│
+│   ├── manager/
+│   ├── indexer/
+│   ├── dashboard/
+│   └── agent/
+├── deployment/
+│   ├── docker/
+│   └── native/
 ├── detection/
 │   ├── rules/
-│   └── decoders/
-│
+│   ├── decoders/
+│   └── threat-intelligence/
 ├── response/
 │   ├── active/
 │   └── playbooks/
-│
 ├── integrations/
-│
+├── monitoring/
+├── agent/
+│   ├── generator/
+│   ├── templates/
+│   ├── profiles/
+│   └── output/          # Generated packages; ignored by Git
+├── benchmark/
+│   ├── engine/
+│   ├── workload/
+│   ├── analyzer/
+│   ├── profiles/
+│   └── reports/
+├── examples/
 └── tests/
 ```
 
-Struktur tersebut akan berkembang mengikuti kebutuhan implementasi.
-
----
-
+`agent/` contains the Wazuh Agent installer-package generator. `benchmark/`
+contains infrastructure benchmarking, workload simulation, and capacity
+planning for DefenseOps Central Server and managed Docker Hosts.
 ## Prinsip Pengembangan
 
 DefenseOps dikembangkan dengan beberapa prinsip:
@@ -439,10 +456,13 @@ DefenseOps masih dalam tahap pengembangan. Arsitektur, konfigurasi, automation, 
 
 ## License
 
-License akan ditentukan sebelum release publik pertama.
+DefenseOps is distributed under its **DefenseOps Source-Available License**
+(see `LICENSE`). Use, study, modification, and source-based development are
+governed by that license. Creating or distributing proprietary/closed-source
+products derived from DefenseOps requires a separate written commercial
+license from the copyright holder; see `COMMERCIAL-LICENSE.md`.
 
----
-
+Copyright (c) 2026 Hendrawan Aprillia Ashari, S.T., M.Kom.
 ## Disclaimer
 
 DefenseOps merupakan project security engineering dan automation.

@@ -1,0 +1,38 @@
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Generated agent packages (do not commit deployment secrets)
+agent/output/*
+!agent/output/.gitkeep
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Benchmark results and temporary test data
+benchmark/results/
+benchmark/reports/generated/
+benchmark/tmp/
+*.fio
+
+# Runtime and temporary files
+*.log
+*.tmp
+*.pid
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backups created by this repair script
+.structure-backup/
