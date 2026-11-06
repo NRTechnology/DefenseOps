@@ -382,15 +382,42 @@ seed_wazuh_configuration() {
     local upstream_config="${WAZUH_SOURCE}/single-node/config"
     local upstream_cert_dir="${upstream_config}/wazuh_indexer_ssl_certs"
     local target_cert_dir="${WAZUH_CONFIG}/wazuh_indexer_ssl_certs"
+    local indexer_source_config="${WAZUH_SOURCE}/build-docker-images/wazuh-indexer/config"
+    local indexer_opensearch_source="${indexer_source_config}/opensearch.yml"
+    local target_opensearch="${WAZUH_CONFIG}/wazuh_indexer/opensearch.yml"
 
-    [[ -d "$upstream_config" ]] || die "Direktori konfigurasi upstream tidak ditemukan."
+    [[ -d "$upstream_config" ]] || die "Direktori konfigurasi upstream tidak ditemukan: ${upstream_config}"
 
-    if [[ ! -f "${WAZUH_CONFIG}/wazuh_indexer/internal_users.yml" ]]; then
-        log "Menyalin konfigurasi awal resmi Wazuh..."
-        cp -a "$upstream_config/." "$WAZUH_CONFIG/"
+    # Seed missing files individually. Never overwrite an existing administrator
+    # configuration just because one other file is missing.
+    install -d -m 0750 "$WAZUH_CONFIG"
+    log "Memastikan seluruh konfigurasi dasar Wazuh tersedia..."
+    cp -a -n "${upstream_config}/." "${WAZUH_CONFIG}/"
+
+    # In the official Wazuh Docker release, opensearch.yml is sourced from the
+    # Indexer image build configuration, not necessarily from single-node/config.
+    # The split Indexer Compose file bind-mounts it from shared/config/wazuh_indexer.
+    if [[ ! -s "$target_opensearch" ]]; then
+        if [[ -s "$indexer_opensearch_source" ]]; then
+            install -d -m 0750 "${WAZUH_CONFIG}/wazuh_indexer"
+            install -m 0640 "$indexer_opensearch_source" "$target_opensearch"
+            log "opensearch.yml disalin dari konfigurasi Indexer resmi: ${indexer_opensearch_source}"
+        else
+            die "opensearch.yml tidak ditemukan di konfigurasi runtime maupun source resmi: ${indexer_opensearch_source}"
+        fi
     else
-        log "Konfigurasi Wazuh yang sudah ada dipertahankan."
+        log "opensearch.yml yang sudah ada dipertahankan."
     fi
+
+    # Validate the required Indexer configuration before changing permissions
+    # or generating Compose files. This catches incomplete seeds early.
+    local required_file
+    for required_file in \
+        "${WAZUH_CONFIG}/wazuh_indexer/opensearch.yml" \
+        "${WAZUH_CONFIG}/wazuh_indexer/wazuh.indexer.yml" \
+        "${WAZUH_CONFIG}/wazuh_indexer/internal_users.yml"; do
+        [[ -s "$required_file" ]] || die "Konfigurasi wajib Wazuh tidak ditemukan atau kosong: ${required_file}"
+    done
 
     if [[ ! -s "${target_cert_dir}/root-ca.pem" ]]; then
         log "Membuat sertifikat TLS self-signed menggunakan certificate generator resmi Wazuh..."
@@ -401,16 +428,15 @@ seed_wazuh_configuration() {
         )
         install -d -m 0750 "$target_cert_dir"
         if [[ -d "$upstream_cert_dir" ]]; then
-            cp -a "${upstream_cert_dir}/." "${target_cert_dir}/"
+            cp -a -n "${upstream_cert_dir}/." "${target_cert_dir}/"
         fi
     else
         log "Sertifikat Wazuh yang sudah ada dipertahankan; memeriksa permission dan ownership."
     fi
 
     repair_wazuh_certificate_permissions
-    ok "Konfigurasi dan sertifikat Wazuh tersedia."
+    ok "Konfigurasi dasar, opensearch.yml, dan sertifikat Wazuh tersedia."
 }
-
 
 prepare_wazuh_config_permissions() {
     log "Menyiapkan permission konfigurasi agar dapat dibaca container Wazuh..."
@@ -442,6 +468,7 @@ prepare_wazuh_config_permissions() {
     fi
 
     local indexer_conf="${WAZUH_CONFIG}/wazuh_indexer/opensearch.yml"
+    [[ -s "$indexer_conf" ]] || die "opensearch.yml tidak ditemukan atau kosong: ${indexer_conf}"
     [[ -r "$indexer_conf" ]] || die "opensearch.yml tidak dapat dibaca oleh host: ${indexer_conf}"
 
     ok "Permission konfigurasi Wazuh disiapkan untuk UID/GID 1000."
