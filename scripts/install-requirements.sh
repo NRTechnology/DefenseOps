@@ -411,6 +411,42 @@ seed_wazuh_configuration() {
     ok "Konfigurasi dan sertifikat Wazuh tersedia."
 }
 
+
+prepare_wazuh_config_permissions() {
+    log "Menyiapkan permission konfigurasi agar dapat dibaca container Wazuh..."
+
+    # Wazuh Indexer and Dashboard run as numeric UID/GID 1000 in the
+    # official containers. The bind-mounted config tree must be traversable
+    # by that identity. Keep access group-restricted rather than world-readable.
+    local path
+    for path in \
+        "$DEFENSEOPS_ROOT" \
+        "$WAZUH_ROOT" \
+        "$WAZUH_SHARED" \
+        "$WAZUH_CONFIG"; do
+        [[ -d "$path" ]] || die "Direktori konfigurasi tidak ditemukan: ${path}"
+        chgrp 1000 "$path"
+        chmod 0750 "$path"
+    done
+
+    chown -R 1000:1000 "$WAZUH_CONFIG"
+    find "$WAZUH_CONFIG" -type d -exec chmod 0750 {} +
+    find "$WAZUH_CONFIG" -type f -exec chmod 0640 {} +
+
+    # Certificate private keys remain restricted to the Wazuh service owner
+    # and its group. The Indexer/Dashboard containers use this identity.
+    if [[ -d "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs" ]]; then
+        chown -R 1000:1000 "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs"
+        find "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs" -type d -exec chmod 0750 {} +
+        find "${WAZUH_CONFIG}/wazuh_indexer_ssl_certs" -type f -exec chmod 0640 {} +
+    fi
+
+    local indexer_conf="${WAZUH_CONFIG}/wazuh_indexer/opensearch.yml"
+    [[ -r "$indexer_conf" ]] || die "opensearch.yml tidak dapat dibaca oleh host: ${indexer_conf}"
+
+    ok "Permission konfigurasi Wazuh disiapkan untuk UID/GID 1000."
+}
+
 generate_password() {
     # Hex characters plus Aa1- meet Wazuh's complexity requirements and avoid
     # Compose interpolation / YAML quoting problems.
@@ -861,6 +897,7 @@ deploy_wazuh() {
 
     load_or_create_credentials
     secure_indexer_internal_users
+    prepare_wazuh_config_permissions
     generate_split_compose_files
     validate_compose_files
 
