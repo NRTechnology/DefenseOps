@@ -957,6 +957,103 @@ verify_final_state() {
     ok "Deployment Wazuh selesai."
 }
 
+
+print_installation_summary() {
+    local primary_ip="" dashboard_url="" credentials_mode="" docker_version="" compose_version=""
+    local host_name="" os_name="" container_status=""
+
+    # Prefer the source address selected by the host's default route.
+    primary_ip="$(ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)"
+
+    # Fallback for hosts without a usable default route.
+    if [[ -z "$primary_ip" ]]; then
+        primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
+
+    if [[ -n "$primary_ip" ]]; then
+        dashboard_url="https://${primary_ip}:8443/"
+    else
+        dashboard_url="https://<IP-ADDRESS-SERVER>:8443/"
+    fi
+
+    host_name="$(hostname -f 2>/dev/null || hostname)"
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    os_name="${PRETTY_NAME:-Ubuntu}"
+
+    docker_version="$(docker --version 2>/dev/null || true)"
+    compose_version="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null || true)"
+
+    if [[ -f "$CREDENTIALS_FILE" ]]; then
+        credentials_mode="$(stat -c '%a (%A)' "$CREDENTIALS_FILE" 2>/dev/null || printf 'unknown')"
+    else
+        credentials_mode="MISSING"
+    fi
+
+    echo
+    printf '%b============================================================%b\n' "$GREEN" "$NC"
+    printf '%b             DEFENSEOPS INSTALLATION SUMMARY%b\n' "$GREEN" "$NC"
+    printf '%b============================================================%b\n' "$GREEN" "$NC"
+
+    printf '\n%b[ HOST ]%b\n' "$BLUE" "$NC"
+    printf 'Hostname              : %s\n' "$host_name"
+    printf 'Operating System      : %s\n' "$os_name"
+    printf 'Docker Engine         : %s\n' "${docker_version:-not detected}"
+    printf 'Docker Compose        : %s\n' "${compose_version:-not detected}"
+    printf 'Wazuh Version         : %s\n' "$WAZUH_VERSION"
+
+    printf '\n%b[ WAZUH DASHBOARD ]%b\n' "$BLUE" "$NC"
+    printf 'Dashboard URL         : %s\n' "$dashboard_url"
+    printf 'Dashboard Port        : 8443/TCP'
+    printf '\n'
+    printf 'Dashboard Username    : admin\n'
+    printf 'Dashboard Password    : see credentials file below\n'
+
+    printf '\n%b[ CREDENTIALS ]%b\n' "$BLUE" "$NC"
+    printf 'Password File         : %s\n' "$CREDENTIALS_FILE"
+    printf 'File Permission       : %s\n' "$credentials_mode"
+    printf 'Read credentials      : sudo cat %q\n' "$CREDENTIALS_FILE"
+    printf 'Recommended handling : keep private; do not share or commit this file.\n'
+
+    printf '\n%b[ COMPOSE FILES ]%b\n' "$BLUE" "$NC"
+    printf 'Indexer               : %s\n' "${WAZUH_ROOT}/indexer/docker-compose.yml"
+    printf 'Manager               : %s\n' "${WAZUH_ROOT}/manager/docker-compose.yml"
+    printf 'Dashboard             : %s\n' "${WAZUH_ROOT}/dashboard/docker-compose.yml"
+    printf 'Shared Docker Network : %s\n' "$WAZUH_NETWORK"
+
+    printf '\n%b[ API ENDPOINTS ]%b\n' "$BLUE" "$NC"
+    printf 'Indexer API           : https://127.0.0.1:9200 (loopback only)\n'
+    printf 'Manager API           : https://127.0.0.1:55000 (loopback only)\n'
+
+    printf '\n%b[ AGENT / SYSLOG PORTS ]%b\n' "$BLUE" "$NC"
+    printf 'Wazuh Agent           : 1514/TCP\n'
+    printf 'Agent Enrollment      : 1515/TCP\n'
+    printf 'Syslog                : 514/UDP\n'
+
+    printf '\n%b[ SERVICE STATUS ]%b\n' "$BLUE" "$NC"
+    docker ps --filter "label=com.defenseops.managed=true" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+
+    printf '\n%b[ LOG FILE ]%b\n' "$BLUE" "$NC"
+    printf 'Installer Log         : %s\n' "$LOG_FILE"
+
+    printf '\n%b[ SECURITY NOTES ]%b\n' "$YELLOW" "$NC"
+    printf '%s\n' \
+        '- Dashboard TLS certificate is self-signed.' \
+        '- Indexer API (9200) and Manager API (55000) are bound to loopback.' \
+        '- Restrict Dashboard, Agent, Enrollment, and Syslog ports with the host/network firewall.' \
+        '- Credentials file is sensitive; retain its 0600 permissions and secure backups.'
+
+    if [[ -z "$primary_ip" ]]; then
+        warn "IP utama server tidak dapat dideteksi otomatis. Ganti placeholder pada Dashboard URL dengan IP server."
+    fi
+
+    printf '%b============================================================%b\n' "$GREEN" "$NC"
+    printf '%b Deployment Wazuh selesai dan ringkasan instalasi ditampilkan.%b\n' "$GREEN" "$NC"
+    printf '%b============================================================%b\n' "$GREEN" "$NC"
+}
+
 main() {
     log "===== DefenseOps Full Requirements & Wazuh Installer ====="
     check_system_requirements
@@ -979,19 +1076,7 @@ main() {
     deploy_wazuh
     verify_final_state
 
-    echo
-    ok "DefenseOps host dan Wazuh single-node berhasil dipersiapkan."
-    log "Dashboard URL : https://<IP-ADDRESS-SERVER>:8443/"
-    log "Dashboard user: admin"
-    log "Credentials   : ${CREDENTIALS_FILE}"
-    log "Compose files :"
-    log "  ${WAZUH_ROOT}/indexer/docker-compose.yml"
-    log "  ${WAZUH_ROOT}/manager/docker-compose.yml"
-    log "  ${WAZUH_ROOT}/dashboard/docker-compose.yml"
-    log "Shared network: ${WAZUH_NETWORK}"
-    warn "Sertifikat yang dibuat adalah self-signed. Browser akan menampilkan peringatan TLS."
-    warn "Port 9200 (Indexer API) dan 55000 (Manager API) hanya dipublikasikan ke loopback."
-    warn "Port 8443 (Dashboard), 1514/1515 TCP (Agent), dan 514 UDP (Syslog) perlu aturan firewall sesuai kebutuhan."
+    print_installation_summary
 }
 
 main "$@"
