@@ -20,6 +20,9 @@ readonly SCRIPT_NAME="$(basename "$0")"
 readonly MIN_CPU_CORES=4
 readonly MIN_RAM_GIB=8
 readonly MIN_STORAGE_GIB=250
+readonly RAW_LOG_RETENTION_DAYS=30
+readonly ALERT_RETENTION_DAYS=90
+readonly MANAGER_ARCHIVE_RETENTION_DAYS=14
 readonly WAZUH_VERSION="${WAZUH_VERSION:-4.14.10}"
 readonly WAZUH_REPO_URL="https://github.com/wazuh/wazuh-docker.git"
 readonly WAZUH_REPO_BRANCH="v${WAZUH_VERSION}"
@@ -437,6 +440,163 @@ seed_wazuh_configuration() {
     repair_wazuh_certificate_permissions
     ok "Konfigurasi dasar, opensearch.yml, dan sertifikat Wazuh tersedia."
 }
+
+configure_raw_log_collection() {
+    local manager_conf="${WAZUH_CONFIG}/wazuh_cluster/wazuh_manager.conf"
+    [[ -s "$manager_conf" ]] || die "Konfigurasi Manager tidak ditemukan: ${manager_conf}"
+
+    log "Mengaktifkan JSON raw event logging pada Wazuh Manager..."
+    MANAGER_CONF="$manager_conf" python3 <<'PYCONF'
+import os, re
+from pathlib import Path
+p = Path(os.environ["MANAGER_CONF"])
+s = p.read_text(encoding="utf-8")
+pattern = re.compile(r"(?ms)(<global>)(.*?)(</global>)")
+m = pattern.search(s)
+if not m:
+    raise SystemExit(f"Blok <global> tidak ditemukan dalam {p}")
+block = m.group(2)
+for key, value in (("logall", "no"), ("logall_json", "yes")):
+    rx = re.compile(rf"(?m)^(\s*<{key}>)[^<]*(</{key}>\s*)$")
+    if rx.search(block):
+        block = rx.sub(rf"\g<1>{value}\g<2>", block, count=1)
+    else:
+        block += f"\n    <{key}>{value}</{key}>"
+s = s[:m.start(2)] + block + s[m.end(2):]
+p.write_text(s, encoding="utf-8")
+PYCONF
+    ok "Raw event JSON logging aktif; plaintext logall tetap nonaktif."
+}
+
+configure_indexer_retention_policies() {
+    log "Menerapkan Index State Management retention policies..."
+    local base_url="https://127.0.0.1:9200" response status
+    local raw_policy alert_policy
+
+    raw_policy="$(jq -n --arg age "${RAW_LOG_RETENTION_DAYS}d" '{policy:{description:"DefenseOps raw event retention",default_state:"active",states:[{name:"active",actions:[],transitions:[{state_name:"delete",conditions:{min_index_age:$age}}]},{name:"delete",actions:[{retry:{count:3,backoff:"exponential",delay:"1m"},delete:{}}],transitions:[]}],ism_template:[{index_patterns:["wazuh-archives-4.x-*"],priority:100}]}}')"
+    alert_policy="$(jq -n --arg age "${ALERT_RETENTION_DAYS}d" '{policy:{description:"DefenseOps security alert retention",default_state:"active",states:[{name:"active",actions:[],transitions:[{state_name:"delete",conditions:{min_index_age:$age}}]},{name:"delete",actions:[{retry:{count:3,backoff:"exponential",delay:"1m"},delete:{}}],transitions:[]}],ism_template:[{index_patterns:["wazuh-alerts-4.x-*"],priority:100}]}}')"
+
+    local policy_id existing seq_no primary_term endpoint
+    for policy_id in defenseops-raw-retention defenseops-alert-retention; do
+        if [[ "$policy_id" == "defenseops-raw-retention" ]]; then
+            endpoint="${base_url}/_plugins/_ism/policies/${policy_id}"
+            response="$raw_policy"
+        else
+            endpoint="${base_url}/_plugins/_ism/policies/${policy_id}"
+            response="$alert_policy"
+        fi
+        existing="$(curl -ksS --connect-timeout 5 --max-time 15 \
+            -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -w '\n%{http_code}' "$endpoint" || true)"
+        status="${existing##*$'\n'}"
+        if [[ "$status" == "200" ]]; then
+            existing="${existing%$'\n'*}"
+            seq_no="$(printf '%s' "$existing" | jq -r '.policy_seq_no // empty')"
+            primary_term="$(printf '%s' "$existing" | jq -r '.policy_primary_term // empty')"
+            [[ "$seq_no" =~ ^[0-9]+$ && "$primary_term" =~ ^[0-9]+$ ]] || die "Metadata policy ${policy_id} tidak valid; menolak overwrite tanpa concurrency control."
+            endpoint="${endpoint}?if_seq_no=${seq_no}&if_primary_term=${primary_term}"
+        elif [[ "$status" != "404" ]]; then
+            die "Gagal membaca policy ${policy_id} (HTTP ${status})."
+        fi
+        status="$(printf '%s' "$response" | curl -ksS --connect-timeout 5 --max-time 30 \
+            -o "/tmp/${policy_id}.json" -w '%{http_code}' \
+            -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -H 'Content-Type: application/json' \
+            --data-binary @- -X PUT "$endpoint")" \
+            || die "Gagal mengirim policy ${policy_id} ke Wazuh Indexer."
+        [[ "$status" =~ ^(200|201)$ ]] || { cat "/tmp/${policy_id}.json" >&2 || true; die "Penerapan policy ${policy_id} gagal (HTTP ${status})."; }
+        rm -f "/tmp/${policy_id}.json"
+    done
+
+    rm -f /tmp/defenseops-ism-raw.json /tmp/defenseops-ism-alerts.json
+    ok "ISM policies aktif: raw ${RAW_LOG_RETENTION_DAYS} hari, alerts ${ALERT_RETENTION_DAYS} hari."
+}
+
+configure_filebeat_archives() {
+    log "Mengaktifkan forwarding raw archives pada Filebeat di Manager..."
+    local container_id=""
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk konfigurasi Filebeat."
+
+    docker exec "$container_id" python3 - <<'PYFILEBEAT'
+import re
+from pathlib import Path
+p = Path("/etc/filebeat/filebeat.yml")
+if not p.is_file():
+    raise SystemExit(f"Filebeat config tidak ditemukan: {p}")
+s = p.read_text(encoding="utf-8")
+# Scope the edit to the Wazuh module's archives subsection; keep the rest of
+# the upstream Filebeat configuration and comments intact.
+module = re.search(r"(?ms)^\s*-\s*module:\s*wazuh\s*$.*?(?=^\s*-\s*module:|\Z)", s)
+if not module:
+    raise SystemExit("Wazuh Filebeat module tidak ditemukan; konfigurasi tidak diubah")
+block = module.group(0)
+archives = re.search(r"(?ms)(^\s*archives:\s*\n)(\s+enabled:\s*)(true|false)", block)
+if not archives:
+    raise SystemExit("archives.enabled tidak ditemukan pada Wazuh Filebeat module")
+block = block[:archives.start(3)] + "true" + block[archives.end(3):]
+s = s[:module.start()] + block + s[module.end():]
+p.write_text(s, encoding="utf-8")
+PYFILEBEAT
+
+    docker exec "$container_id" filebeat test config -c /etc/filebeat/filebeat.yml -e >/dev/null \
+        || die "Validasi konfigurasi Filebeat gagal setelah mengaktifkan archives."
+    docker restart "$container_id" >/dev/null
+    ok "Filebeat archives aktif dan Manager direstart untuk menerapkan konfigurasi."
+}
+
+install_manager_archive_retention() {
+    local script="/usr/local/sbin/defenseops-manager-archive-retention"
+    local service="/etc/systemd/system/defenseops-manager-archive-retention.service"
+    local timer="/etc/systemd/system/defenseops-manager-archive-retention.timer"
+
+    log "Menyiapkan cleanup arsip lokal Manager (${MANAGER_ARCHIVE_RETENTION_DAYS} hari)..."
+    cat > "$script" <<'RETENTION_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+RETENTION_DAYS=14
+LOG_FILE=/var/log/defenseops-manager-archive-retention.log
+exec >> "$LOG_FILE" 2>&1
+printf '[%s] Starting Manager archives cleanup (older than %s days)\n' "$(date -Is)" "$RETENTION_DAYS"
+container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+if [[ -z "$container_id" ]]; then
+    echo 'Wazuh Manager container is not running; cleanup skipped.'
+    exit 0
+fi
+# Delete only rotated/compressed archive files; never touch active JSON/log files.
+docker exec "$container_id" find /var/ossec/logs/archives -type f -name '*.gz' -mtime "+${RETENTION_DAYS}" -print -delete
+printf '[%s] Cleanup completed\n' "$(date -Is)"
+RETENTION_SCRIPT
+    sed -i "s/^RETENTION_DAYS=14$/RETENTION_DAYS=${MANAGER_ARCHIVE_RETENTION_DAYS}/" "$script"
+    chmod 0750 "$script"
+
+    cat > "$service" <<'SERVICE'
+[Unit]
+Description=DefenseOps Wazuh Manager local archives retention cleanup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/defenseops-manager-archive-retention
+SERVICE
+    cat > "$timer" <<'TIMER'
+[Unit]
+Description=Daily DefenseOps Wazuh Manager archives retention cleanup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+    touch /var/log/defenseops-manager-archive-retention.log
+    chmod 0600 /var/log/defenseops-manager-archive-retention.log
+    systemctl daemon-reload
+    systemctl enable --now defenseops-manager-archive-retention.timer
+    ok "Systemd timer cleanup arsip lokal aktif (${MANAGER_ARCHIVE_RETENTION_DAYS} hari)."
+}
+
 
 prepare_wazuh_config_permissions() {
     log "Menyiapkan permission konfigurasi agar dapat dibaca container Wazuh..."
@@ -991,6 +1151,7 @@ deploy_wazuh() {
     create_docker_network
     prepare_wazuh_source
     seed_wazuh_configuration
+    configure_raw_log_collection
 
     log "Mengambil image Wazuh Indexer untuk membuat password hash..."
     docker pull "wazuh/wazuh-indexer:${WAZUH_VERSION}"
@@ -1004,11 +1165,15 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Indexer..."
     compose_up indexer
     wait_for_indexer
+    configure_indexer_retention_policies
 
     log "Menjalankan Wazuh Manager..."
     compose_up manager
     wait_for_manager
     rotate_wazuh_api_admin_password
+    configure_filebeat_archives
+    wait_for_manager
+    install_manager_archive_retention
 
     log "Menjalankan Wazuh Dashboard..."
     compose_up dashboard
@@ -1083,6 +1248,12 @@ print_installation_summary() {
     printf "Dashboard Username    : %s\n" "${WAZUH_DASHBOARD_USERNAME:-admin}"
     printf 'Dashboard Password    : WAZUH_DASHBOARD_PASSWORD in credentials file\n'
 
+    printf '\n%b[ LOG COLLECTION & RETENTION ]%b\n' "$BLUE" "$NC"
+    printf 'Raw JSON Events       : enabled\n'
+    printf 'Raw Logs Indexer      : %s days\n' "$RAW_LOG_RETENTION_DAYS"
+    printf 'Security Alerts       : %s days\n' "$ALERT_RETENTION_DAYS"
+    printf 'Manager Local Archives: %s days (compressed files)\n' "$MANAGER_ARCHIVE_RETENTION_DAYS"
+
     printf '\n%b[ CREDENTIALS ]%b\n' "$BLUE" "$NC"
     printf 'Password File         : %s\n' "$CREDENTIALS_FILE"
     printf 'File Permission       : %s\n' "$credentials_mode"
@@ -1137,6 +1308,8 @@ main() {
         log "Rencana: repository Ubuntu -> dependencies -> Docker/Compose -> sysctl ->"
         log "direktori/network -> source Wazuh ${WAZUH_VERSION} -> TLS/passwords ->"
         log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> health checks."
+        log "Raw JSON events -> Indexer ISM retention (raw 30d, alerts 90d) ->"
+        log "Manager local compressed archives cleanup (14d)."
         exit 0
     fi
 
