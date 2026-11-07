@@ -6,12 +6,12 @@
 # Description : Generate a deployment bundle for enrolling Linux endpoints
 #               into the DefenseOps Wazuh Manager.
 #
-# Version     : 1.0.0
+# Version     : 1.2.1
 # Release     : 2026-11-07
 # Maintainer  : DefenseOps
 #
 # Execution   : Run this script ONLY on the DefenseOps Manager server.
-# Output      : install-agent.sh, ossec.conf, and README.txt
+# Output      : <repository>/agent/output/ (ignored by Git)
 # Target      : Linux endpoints (Debian/Ubuntu and RHEL-compatible)
 #
 # Requirements:
@@ -37,9 +37,9 @@
 # ============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.1"
 SCRIPT_RELEASE="2026-11-07"
-OUT_DIR="/opt/defenseops/agent-deployment"
+OUT_DIR=""
 MANAGER_OVERRIDE=""
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -58,7 +58,7 @@ Usage:
 
 Options:
   -m, --manager IP/FQDN    Override auto-detected Manager address
-  -o, --output DIR         Output directory (default: /opt/defenseops/agent-deployment)
+  -o, --output DIR         Output directory (default: <repository>/agent/output)
   -V, --version            Show generator version
   -h, --help               Show help
 
@@ -86,6 +86,13 @@ command -v ip >/dev/null 2>&1 || die "iproute2 (ip command) is required."
 command -v ss >/dev/null 2>&1 || die "ss command is required."
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+# Keep generated deployment artifacts inside the checked-out repository.
+# The directory is excluded from Git via the repository .gitignore.
+if [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="${REPO_ROOT}/agent/output"
+fi
+
 if [[ -n "$MANAGER_OVERRIDE" ]]; then
   MANAGER="$MANAGER_OVERRIDE"
 else
