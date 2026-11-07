@@ -17,6 +17,7 @@ IFS=$'\n\t'
 umask 027
 
 readonly SCRIPT_NAME="$(basename "$0")"
+readonly DEFENSEOPS_HOSTNAME="defenseops"
 readonly MIN_CPU_CORES=4
 readonly MIN_RAM_GIB=8
 readonly MIN_STORAGE_GIB=250
@@ -90,6 +91,44 @@ backup_file() {
         cp -a "$file" "${file}.defenseops-backup"
         log "Backup dibuat: ${file}.defenseops-backup"
     fi
+}
+
+
+configure_host_hostname() {
+    log "Mengatur hostname host menjadi ${DEFENSEOPS_HOSTNAME}..."
+
+    if command -v hostnamectl >/dev/null 2>&1; then
+        hostnamectl set-hostname "$DEFENSEOPS_HOSTNAME"
+    else
+        printf '%s\n' "$DEFENSEOPS_HOSTNAME" > /etc/hostname
+        hostname "$DEFENSEOPS_HOSTNAME"
+    fi
+
+    # Preserve existing hosts entries; only normalize the 127.0.1.1 mapping.
+    local hosts_tmp
+    hosts_tmp="$(mktemp)"
+    if [[ -f /etc/hosts ]]; then
+        awk -v host="$DEFENSEOPS_HOSTNAME" '
+            /^[[:space:]]*127\.0\.1\.1[[:space:]]/ {
+                if (!done) {
+                    print "127.0.1.1\t" host
+                    done=1
+                }
+                next
+            }
+            { print }
+            END {
+                if (!done) print "127.0.1.1\t" host
+            }
+        ' /etc/hosts > "$hosts_tmp"
+    else
+        printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n' "$DEFENSEOPS_HOSTNAME" > "$hosts_tmp"
+    fi
+    install -m 0644 "$hosts_tmp" /etc/hosts
+    rm -f "$hosts_tmp"
+
+    [[ "$(hostname)" == "$DEFENSEOPS_HOSTNAME" ]] || die "Gagal mengatur hostname menjadi ${DEFENSEOPS_HOSTNAME}."
+    ok "Hostname host: $(hostname)."
 }
 
 check_system_requirements() {
@@ -1080,6 +1119,106 @@ wait_for_manager() {
     die "Wazuh Manager API belum siap. Periksa log di atas."
 }
 
+configure_manager_api_tls() {
+    log "Mengonfigurasi Wazuh Manager API menggunakan sertifikat TLS resmi DefenseOps..."
+
+    local container_id
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk konfigurasi TLS API."
+
+    # The official Manager certificate already has SAN DNS:wazuh.manager.
+    # Copy it into the API's persistent configuration volume. Wazuh API 4.14
+    # accepts certificate/key basenames here, not absolute paths.
+    docker exec "$container_id" sh -c '
+        set -eu
+        ssl_dir=/var/ossec/api/configuration/ssl
+        install -d -o wazuh -g wazuh -m 0750 "$ssl_dir"
+        install -o wazuh -g wazuh -m 0640 /etc/ssl/filebeat.pem "$ssl_dir/manager-api.crt"
+        install -o wazuh -g wazuh -m 0640 /etc/ssl/filebeat.key "$ssl_dir/manager-api.key"
+    '
+
+    docker exec -i "$container_id" python3 - <<'PYAPI'
+from pathlib import Path
+
+path = Path("/var/ossec/api/configuration/api.yaml")
+text = path.read_text(encoding="utf-8")
+
+old = """# https:
+#  enabled: yes
+#  key: "server.key"
+#  cert: "server.crt"
+#  use_ca: False
+#  ca: "ca.crt"
+#  ssl_protocol: "auto"
+#  ssl_ciphers: ""
+"""
+new = """https:
+  enabled: yes
+  key: "manager-api.key"
+  cert: "manager-api.crt"
+  use_ca: false
+  ssl_protocol: "auto"
+  ssl_ciphers: ""
+"""
+
+if new in text:
+    print("Manager API TLS configuration already applied.")
+elif old in text:
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    print("Manager API TLS configuration applied.")
+else:
+    raise SystemExit(
+        "Unexpected api.yaml HTTPS configuration; refusing to overwrite custom settings."
+    )
+PYAPI
+
+    # Validate the installed certificate identity and private-key pairing
+    # before restarting the Manager container.
+    docker exec "$container_id" sh -c '
+        set -eu
+        cert=/var/ossec/api/configuration/ssl/manager-api.crt
+        key=/var/ossec/api/configuration/ssl/manager-api.key
+        cert_pub="$(openssl x509 -in "$cert" -pubkey -noout | openssl sha256)"
+        key_pub="$(openssl pkey -in "$key" -pubout | openssl sha256)"
+        [ "$cert_pub" = "$key_pub" ] || {
+            echo "Manager API certificate and private key do not match." >&2
+            exit 1
+        }
+        openssl x509 -in "$cert" -noout -checkhost wazuh.manager
+    ' || die "Validasi sertifikat Manager API gagal."
+
+    log "Restart Wazuh Manager untuk menerapkan TLS API..."
+    docker restart "$container_id" >/dev/null
+    wait_for_manager_tls
+    ok "Wazuh Manager API menggunakan sertifikat TLS dengan SAN wazuh.manager."
+}
+
+wait_for_manager_tls() {
+    log "Memverifikasi HTTPS dan hostname sertifikat Manager API..."
+    local attempt status
+    local ca_file="${WAZUH_CONFIG}/wazuh_indexer_ssl_certs/root-ca-manager.pem"
+
+    [[ -s "$ca_file" ]] || die "Root CA Wazuh tidak ditemukan: ${ca_file}"
+
+    for attempt in $(seq 1 60); do
+        status="$(curl --silent --show-error --connect-timeout 3 --max-time 8 \
+            --cacert "$ca_file" \
+            --resolve wazuh.manager:55000:127.0.0.1 \
+            -o /dev/null -w '%{http_code}' \
+            -u "${WAZUH_MANAGER_API_USERNAME}:${WAZUH_MANAGER_API_PASSWORD}" \
+            -X POST https://wazuh.manager:55000/security/user/authenticate?raw=true \
+            2>/dev/null || true)"
+        if [[ "$status" == "200" ]]; then
+            ok "Manager API TLS certificate verification and authentication succeeded."
+            return
+        fi
+        sleep 5
+    done
+
+    docker logs --tail=120 defenseops-manager-wazuh.manager-1 2>&1 || true
+    die "Manager API belum lolos verifikasi TLS setelah restart."
+}
+
 wait_for_dashboard() {
     log "Menunggu Wazuh Dashboard siap (maksimal 5 menit)..."
     local attempt
@@ -1170,6 +1309,7 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Manager..."
     compose_up manager
     wait_for_manager
+    configure_manager_api_tls
     rotate_wazuh_api_admin_password
     configure_filebeat_archives
     wait_for_manager
@@ -1305,14 +1445,15 @@ main() {
     if (( DRY_RUN )); then
         echo
         log "DRY-RUN: tidak ada perubahan yang diterapkan."
-        log "Rencana: repository Ubuntu -> dependencies -> Docker/Compose -> sysctl ->"
+        log "Rencana: hostname defenseops -> repository Ubuntu -> dependencies -> Docker/Compose -> sysctl ->"
         log "direktori/network -> source Wazuh ${WAZUH_VERSION} -> TLS/passwords ->"
-        log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> health checks."
+        log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> Manager API TLS -> health checks."
         log "Raw JSON events -> Indexer ISM retention (raw 30d, alerts 90d) ->"
         log "Manager local compressed archives cleanup (14d)."
         exit 0
     fi
 
+    configure_host_hostname
     configure_ubuntu_repositories
     install_base_packages
     install_docker
