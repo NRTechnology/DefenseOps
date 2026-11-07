@@ -150,7 +150,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="4.14.10"
+WAZUH_AGENT_VERSION="4.14.10"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -412,7 +412,7 @@ case "${ID:-}" in
       'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
       > /etc/apt/sources.list.d/wazuh.list
     apt-get update
-    apt-get install -y "wazuh-agent=${VERSION}-1"
+    apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
     ;;
   rhel|rocky|almalinux|centos|ol|fedora|amzn)
     command -v rpm >/dev/null 2>&1 || die "rpm command not found."
@@ -428,9 +428,9 @@ baseurl=https://packages.wazuh.com/4.x/yum/
 priority=1
 EOF
     if command -v dnf >/dev/null 2>&1; then
-      dnf install -y "wazuh-agent-${VERSION}-1"
+      dnf install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
     else
-      yum install -y "wazuh-agent-${VERSION}-1"
+      yum install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
     fi
     ;;
   *)
