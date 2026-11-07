@@ -37,7 +37,7 @@
 # ============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 SCRIPT_RELEASE="2026-11-07"
 OUT_DIR=""
 MANAGER_OVERRIDE=""
@@ -602,12 +602,12 @@ ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_NAME}"
 CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
 TMP_ARCHIVE="$(mktemp "${OUT_DIR}/.defenseops-agent-bundle.XXXXXX")"
 
-tar -czf "$TMP_ARCHIVE" -C "$OUT_DIR" \\
-  install-agent.sh \\
-  ossec.conf \\
-  README.txt \\
-  profiles \\
-  deploy-agent-profiles.sh \\
+tar -czf "$TMP_ARCHIVE" -C "$OUT_DIR" \
+  install-agent.sh \
+  ossec.conf \
+  README.txt \
+  profiles \
+  deploy-agent-profiles.sh \
   enable-docker-listener.sh
 
 chmod 0640 "$TMP_ARCHIVE"
@@ -621,8 +621,8 @@ TMP_ARCHIVE=""
 chmod 0640 "$CHECKSUM_PATH"
 
 log "Deployment bundle generated:"
-printf '  Files   : %s\\n' "$OUT_DIR"
-printf '  Archive : %s\\n' "$ARCHIVE_PATH"
-printf '  SHA256  : %s\\n' "$CHECKSUM_PATH"
+printf '  Files   : %s\n' "$OUT_DIR"
+printf '  Archive : %s\n' "$ARCHIVE_PATH"
+printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
 log "Copy the .tar.gz archive to the endpoint, verify its checksum, extract it, then run install-agent.sh."
 log "No enrollment secret was copied or embedded."
