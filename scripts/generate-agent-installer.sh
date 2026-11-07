@@ -37,9 +37,8 @@
 # ============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_RELEASE="2026-11-07"
-
 OUT_DIR="/opt/defenseops/agent-deployment"
 MANAGER_OVERRIDE=""
 VERSION="4.14.10"
@@ -60,7 +59,7 @@ Usage:
 Options:
   -m, --manager IP/FQDN    Override auto-detected Manager address
   -o, --output DIR         Output directory (default: /opt/defenseops/agent-deployment)
-  -V, --version            Show script version
+  -V, --version            Show generator version
   -h, --help               Show help
 
 The generated endpoint bundle contains:
@@ -331,6 +330,203 @@ DEFENSEOPS_AGENT_INSTALLER_EOF
 chown root:root "${OUT_DIR}/install-agent.sh"
 chmod 0750 "${OUT_DIR}/install-agent.sh"
 
+# Generate centralized monitoring profiles for Wazuh Agent Groups.
+mkdir -p "${OUT_DIR}/profiles"/{linux-server,web-server,database-server,docker-host}
+chmod 0750 "${OUT_DIR}/profiles" "${OUT_DIR}/profiles"/*
+
+cat > "${OUT_DIR}/profiles/linux-server/agent.conf" <<'PROFILE_LINUX'
+<!-- DefenseOps profile: linux-server -->
+<agent_config os="^Linux">
+  <agent_config os="^Ubuntu|^Debian">
+    <localfile><location>/var/log/auth.log</location><log_format>syslog</log_format></localfile>
+    <localfile><location>/var/log/syslog</location><log_format>syslog</log_format></localfile>
+    <localfile><location>/var/log/kern.log</location><log_format>syslog</log_format></localfile>
+  </agent_config>
+  <agent_config os="^Rocky|^AlmaLinux|^CentOS|^Red Hat|^Oracle Linux|^Amazon Linux">
+    <localfile><location>/var/log/secure</location><log_format>syslog</log_format></localfile>
+    <localfile><location>/var/log/messages</location><log_format>syslog</log_format></localfile>
+  </agent_config>
+  <localfile><location>/var/log/audit/audit.log</location><log_format>audit</log_format></localfile>
+  <syscheck>
+    <disabled>no</disabled><frequency>43200</frequency><scan_on_start>yes</scan_on_start>
+    <directories realtime="yes">/etc</directories>
+    <directories realtime="yes">/boot</directories>
+    <directories realtime="yes">/usr/local/bin</directories>
+    <directories realtime="yes">/usr/local/sbin</directories>
+    <ignore>/etc/mtab</ignore><ignore>/etc/hosts.deny</ignore><ignore>/etc/adjtime</ignore>
+    <ignore type="sregex">.log$|.tmp$|.swp$</ignore>
+    <skip_dev>yes</skip_dev><skip_proc>yes</skip_proc><skip_sys>yes</skip_sys><skip_nfs>yes</skip_nfs>
+  </syscheck>
+</agent_config>
+PROFILE_LINUX
+
+cat > "${OUT_DIR}/profiles/web-server/agent.conf" <<'PROFILE_WEB'
+<!-- DefenseOps profile: web-server -->
+<agent_config os="^Linux">
+  <localfile><location>/var/log/nginx/access.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/log/nginx/error.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/log/apache2/access.log</location><log_format>apache</log_format></localfile>
+  <localfile><location>/var/log/apache2/error.log</location><log_format>apache</log_format></localfile>
+  <localfile><location>/var/log/httpd/access_log</location><log_format>apache</log_format></localfile>
+  <localfile><location>/var/log/httpd/error_log</location><log_format>apache</log_format></localfile>
+  <localfile><location>/var/log/php*-fpm.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/log/php-fpm/error.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/www/*/storage/logs/laravel.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/apps/*/storage/logs/laravel.log</location><log_format>syslog</log_format></localfile>
+  <syscheck>
+    <directories realtime="yes">/var/www/*/app</directories>
+    <directories realtime="yes">/var/www/*/bootstrap</directories>
+    <directories realtime="yes">/var/www/*/config</directories>
+    <directories realtime="yes">/var/www/*/routes</directories>
+    <directories realtime="yes">/var/www/*/resources</directories>
+    <directories realtime="yes">/var/www/*/public</directories>
+    <directories realtime="yes">/var/apps/*/app</directories>
+    <directories realtime="yes">/var/apps/*/bootstrap</directories>
+    <directories realtime="yes">/var/apps/*/config</directories>
+    <directories realtime="yes">/var/apps/*/routes</directories>
+    <directories realtime="yes">/var/apps/*/resources</directories>
+    <directories realtime="yes">/var/apps/*/public</directories>
+    <ignore>/var/www/*/public/storage</ignore><ignore>/var/www/*/public/uploads</ignore>
+    <ignore>/var/apps/*/public/storage</ignore><ignore>/var/apps/*/public/uploads</ignore>
+    <ignore type="sregex">/storage/|/cache/|/sessions/|.log$|.tmp$|.swp$</ignore>
+  </syscheck>
+</agent_config>
+PROFILE_WEB
+
+cat > "${OUT_DIR}/profiles/database-server/agent.conf" <<'PROFILE_DB'
+<!-- DefenseOps profile: database-server -->
+<agent_config os="^Linux">
+  <localfile><location>/var/log/mysql/error.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/log/mariadb/mariadb.log</location><log_format>syslog</log_format></localfile>
+  <localfile><location>/var/log/mysql/mariadb.log</location><log_format>syslog</log_format></localfile>
+  <syscheck>
+    <directories realtime="yes">/etc/mysql</directories>
+    <directories>/etc/my.cnf</directories>
+    <directories realtime="yes">/etc/my.cnf.d</directories>
+    <ignore type="sregex">.log$|.tmp$|.swp$</ignore>
+  </syscheck>
+</agent_config>
+PROFILE_DB
+
+cat > "${OUT_DIR}/profiles/docker-host/agent.conf" <<'PROFILE_DOCKER'
+<!-- DefenseOps profile: docker-host -->
+<agent_config os="^Linux">
+  <localfile>
+    <location>/var/lib/docker/containers/*/*-json.log</location>
+    <log_format>json</log_format>
+  </localfile>
+  <syscheck>
+    <directories realtime="yes">/etc/docker</directories>
+    <directories realtime="yes">/etc/containerd</directories>
+    <directories realtime="yes">/opt/docker</directories>
+    <directories realtime="yes">/opt/docker-apps</directories>
+    <ignore type="sregex">.log$|.tmp$|.swp$|/vendor/|/node_modules/|/cache/</ignore>
+  </syscheck>
+</agent_config>
+PROFILE_DOCKER
+
+# Optional endpoint-side helper for Docker event monitoring.
+cat > "${OUT_DIR}/enable-docker-listener.sh" <<'DOCKER_LISTENER'
+#!/usr/bin/env bash
+# Enable Wazuh Docker event listener on a Linux Docker host.
+set -Eeuo pipefail
+die(){ echo "[ERROR] $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "Run on the Docker endpoint as root."
+command -v docker >/dev/null 2>&1 || die "Docker CLI not found."
+docker info >/dev/null 2>&1 || die "Docker daemon is not reachable."
+command -v python3 >/dev/null 2>&1 || die "Python 3 is required."
+PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+python3 -c 'import sys; raise SystemExit(0 if (3,8) <= sys.version_info[:2] <= (3,13) else 1)' \
+  || die "Wazuh Docker listener dependency is documented for Python 3.8-3.13; found ${PYVER}."
+AGENT_CONF="/var/ossec/etc/ossec.conf"
+LISTENER="/var/ossec/wodles/docker/DockerListener"
+VENV="/var/ossec/wodles/docker/venv"
+[[ -s "$AGENT_CONF" ]] || die "Wazuh Agent config not found: $AGENT_CONF"
+[[ -f "$LISTENER" ]] || die "Wazuh DockerListener script not found: $LISTENER"
+command -v systemctl >/dev/null 2>&1 || die "systemd is required."
+
+STAMP="$(date +%Y%m%d%H%M%S)"
+cp -a "$AGENT_CONF" "${AGENT_CONF}.pre-docker-listener.${STAMP}"
+cp -a "$LISTENER" "${LISTENER}.pre-docker-listener.${STAMP}"
+
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --disable-pip-version-check --no-cache-dir \
+  "docker==7.1.0" "urllib3==1.26.20" "requests==2.32.2"
+
+# Point the bundled DockerListener to the isolated virtual environment.
+sed -i "1c\\#!${VENV}/bin/python3" "$LISTENER"
+
+if ! grep -q 'wodle name="docker-listener"' "$AGENT_CONF"; then
+  cat >> "$AGENT_CONF" <<'XML'
+
+<ossec_config>
+  <wodle name="docker-listener">
+    <disabled>no</disabled>
+    <attempts>5</attempts>
+    <run_on_start>yes</run_on_start>
+    <interval>1m</interval>
+  </wodle>
+</ossec_config>
+XML
+fi
+
+if systemctl restart wazuh-agent && systemctl is-active --quiet wazuh-agent; then
+  echo "[INFO] Wazuh Docker listener enabled."
+  echo "[INFO] Check /var/ossec/logs/ossec.log for DockerListener startup status."
+else
+  cp -a "${AGENT_CONF}.pre-docker-listener.${STAMP}" "$AGENT_CONF"
+  cp -a "${LISTENER}.pre-docker-listener.${STAMP}" "$LISTENER"
+  systemctl restart wazuh-agent || true
+  die "Agent restart failed. Original config and DockerListener were restored."
+fi
+DOCKER_LISTENER
+chmod 0750 "${OUT_DIR}/enable-docker-listener.sh"
+
+# Separate, explicitly-confirmed deployment helper. It does not run automatically.
+cat > "${OUT_DIR}/deploy-agent-profiles.sh" <<'DEPLOY_PROFILES'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CONTAINER="${WAZUH_MANAGER_CONTAINER:-defenseops-manager-wazuh.manager-1}"
+BUNDLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE_GROUPS=(linux-server web-server database-server docker-host)
+die(){ echo "[ERROR] $*" >&2; exit 1; }
+log(){ echo "[INFO] $*"; }
+[[ $EUID -eq 0 ]] || die "Run on DefenseOps host as root."
+command -v docker >/dev/null 2>&1 || die "Docker CLI is required."
+docker inspect "$CONTAINER" >/dev/null 2>&1 || die "Manager container not found: $CONTAINER"
+docker exec "$CONTAINER" test -x /var/ossec/bin/verify-agent-conf || die "verify-agent-conf unavailable."
+
+echo "Publish four centralized profiles to Manager container: $CONTAINER"
+read -r -p "Continue? [y/N] " answer
+[[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]] || { echo "Cancelled."; exit 0; }
+
+STAMP="$(date +%Y%m%d%H%M%S)"
+for group in "${PROFILE_GROUPS[@]}"; do
+  src="${BUNDLE_DIR}/profiles/${group}/agent.conf"
+  [[ -s "$src" ]] || die "Missing profile: $src"
+  if ! docker exec "$CONTAINER" /var/ossec/bin/agent_groups -l 2>/dev/null | grep -Eq "^[[:space:]]*${group}[[:space:]]"; then
+    docker exec "$CONTAINER" /var/ossec/bin/agent_groups -a -g "$group" -q
+  fi
+  remote_dir="/var/ossec/etc/shared/${group}"
+  remote_tmp="${remote_dir}/agent.conf.tmp.${STAMP}"
+  docker exec "$CONTAINER" install -d -o wazuh -g wazuh -m 0750 "$remote_dir"
+  docker cp "$src" "${CONTAINER}:${remote_tmp}"
+  docker exec "$CONTAINER" chown wazuh:wazuh "$remote_tmp"
+  docker exec "$CONTAINER" chmod 0660 "$remote_tmp"
+  docker exec "$CONTAINER" /var/ossec/bin/verify-agent-conf -f "$remote_tmp"
+  if docker exec "$CONTAINER" test -f "${remote_dir}/agent.conf"; then
+    docker exec "$CONTAINER" cp -a "${remote_dir}/agent.conf" "${remote_dir}/agent.conf.bak.${STAMP}"
+  fi
+  docker exec "$CONTAINER" mv -f "$remote_tmp" "${remote_dir}/agent.conf"
+  docker exec "$CONTAINER" chown wazuh:wazuh "${remote_dir}/agent.conf"
+  docker exec "$CONTAINER" chmod 0660 "${remote_dir}/agent.conf"
+  log "Published and validated group: $group"
+done
+log "Profiles published. Wazuh distributes shared configuration automatically."
+log "Assign Agent Group membership separately by Agent ID; avoid -f unless replacing all memberships."
+DEPLOY_PROFILES
+chmod 0750 "${OUT_DIR}/deploy-agent-profiles.sh"
+
 cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps - Wazuh Linux Agent Deployment
 =========================================
@@ -339,35 +535,52 @@ Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
 Enrollment   : ${REG_PORT}/TCP
-Agent version: ${VERSION}
 
-Requirements:
-- Linux endpoint using Debian/Ubuntu or RHEL-compatible distribution
-- Root/sudo access
-- Outbound connectivity to the Manager on TCP ${MANAGER_PORT} and TCP ${REG_PORT}
-- Internet access to packages.wazuh.com during installation
+Bundle:
+  install-agent.sh
+  enable-docker-listener.sh (optional; run only on Docker endpoints)
+  ossec.conf
+  profiles/linux-server/agent.conf
+  profiles/web-server/agent.conf
+  profiles/database-server/agent.conf
+  profiles/docker-host/agent.conf
+  deploy-agent-profiles.sh
 
-Install:
-  chmod 750 install-agent.sh
-  sudo ./install-agent.sh
+Safe deployment:
+1. Review the profile paths and remove log sources not present on the target distro.
+2. Run deploy-agent-profiles.sh on DefenseOps as root. It asks confirmation,
+   creates missing groups, stages files, validates each with verify-agent-conf,
+   backs up existing agent.conf, then atomically activates the new file.
+3. Install endpoint Agent with sudo ./install-agent.sh.
+4. On Docker endpoints only, optionally enable Docker event collection:
+     sudo ./enable-docker-listener.sh
+   This installs pinned Python dependencies in an isolated virtualenv, backs up
+   the local Agent config and DockerListener, then enables the local Docker wodle.
+5. After the Agent appears in Dashboard, assign only applicable groups:
+   docker exec ${MANAGER_CONTAINER} /var/ossec/bin/agent_groups -a -i AGENT_ID -g linux-server
+   docker exec ${MANAGER_CONTAINER} /var/ossec/bin/agent_groups -a -i AGENT_ID -g web-server
+   docker exec ${MANAGER_CONTAINER} /var/ossec/bin/agent_groups -a -i AGENT_ID -g database-server
+   docker exec ${MANAGER_CONTAINER} /var/ossec/bin/agent_groups -a -i AGENT_ID -g docker-host
+   Multiple groups are supported. Do not use -f unless replacing all memberships.
+6. Verify membership and shared configuration on the endpoint.
 
-The installer requests the enrollment password interactively.
-Do not put the password in this directory or send it through chat/email.
-The enrollment password is not included in this bundle.
-
-The generated ossec.conf records the Manager connection profile. During
-installation, Wazuh's deployment variables apply the same Manager and
-enrollment settings while preserving the vendor ossec.conf defaults
-(Syscheck, Rootcheck, Syscollector and log collection).
-
-Optional:
-  sudo ./install-agent.sh --name HOSTNAME --group EXISTING_GROUP
-  sudo ./install-agent.sh --manager MANAGER_IP
-
-After installation, verify the endpoint status is Active in the DefenseOps Dashboard.
+Profile notes:
+- linux-server: auth/system/kernel/audit logs; realtime FIM on critical OS paths.
+- web-server: Nginx/Apache/PHP-FPM/Laravel logs; realtime FIM on application code.
+- database-server: MariaDB/MySQL logs; realtime FIM on DB configuration only.
+- docker-host: Docker json-file runtime logs; realtime FIM on Docker/Compose configuration.
+- FIM realtime applies to directories. Public paths may include uploads; review excludes.
+- Never enable report_changes for .env, private keys, credentials, or secrets.
+- Do not FIM live database data (/var/lib/mysql, /var/lib/mariadb).
+- Docker JSON log collection assumes the json-file logging driver.
+- Docker event listener is a separate local Agent module. On Docker endpoints,
+  run enable-docker-listener.sh explicitly. It uses an isolated Python virtualenv,
+  pinned Docker Python dependencies, and backups before changing local ossec.conf.
+- This bundle is not deployed until deploy-agent-profiles.sh is run and confirmed.
+- Enrollment password is never included in the bundle.
 EOF
 chmod 0640 "${OUT_DIR}/README.txt"
 
-log "Deployment bundle generated. Run install-agent.sh ONLY on target Linux endpoints:"
-printf '  %s\n' "${OUT_DIR}/install-agent.sh" "${OUT_DIR}/ossec.conf" "${OUT_DIR}/README.txt"
+log "Bundle generated. install-agent.sh is ONLY for Linux endpoints:"
+printf '  %s\n' "${OUT_DIR}/install-agent.sh" "${OUT_DIR}/profiles" "${OUT_DIR}/deploy-agent-profiles.sh" "${OUT_DIR}/README.txt"
 log "No enrollment secret was copied or embedded."
