@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.3.3
+# Version     : 1.3.4
 # Release     : 2026-11-07
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 SCRIPT_RELEASE="2026-11-07"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -451,9 +451,33 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${AGENT_CONF}.pre-defenseops-${ENDPOINT_PROFILE}.${STAMP}"
 TMP_AGENT_CONF="$(mktemp "${AGENT_CONF}.tmp.XXXXXX")"
 PROFILE_BLOCK="$(mktemp)"
+# If anything fails after the service is stopped, restore the original
+# configuration (when replacement already happened) and start the Agent again.
+AGENT_SERVICE_STOPPED=0
+AGENT_CONFIG_REPLACED=0
 cleanup_files(){
+  local exit_code=$?
+  trap - EXIT
+
+  if (( exit_code != 0 && AGENT_SERVICE_STOPPED == 1 )); then
+    warn "Installer failed while the Agent service was stopped; performing rollback."
+    if (( AGENT_CONFIG_REPLACED == 1 )) && [[ -s "$BACKUP" ]]; then
+      if cp -a -- "$BACKUP" "$AGENT_CONF"; then
+        log "Original ossec.conf restored from ${BACKUP}."
+      else
+        warn "Could not restore ${BACKUP}; manual recovery is required."
+      fi
+    fi
+    if systemctl start wazuh-agent; then
+      log "Wazuh Agent service started after rollback."
+    else
+      warn "Could not start wazuh-agent after rollback; inspect systemctl status."
+    fi
+  fi
+
   rm -f "${TMP_AGENT_CONF:-}" "${PROFILE_BLOCK:-}"
   cleanup
+  exit "$exit_code"
 }
 trap cleanup_files EXIT
 
@@ -481,23 +505,22 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   cp -a "$AGENT_CONF" "$BACKUP"
   {
     cat "$AGENT_CONF"
-    printf '\\n'
+    printf '\n'
     cat "$PROFILE_BLOCK"
   } > "$TMP_AGENT_CONF"
   chown --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
   chmod --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
 
-  systemctl stop wazuh-agent 2>/dev/null || true
-  install -o "$(stat -c '%u' "$AGENT_CONF")" \\
-    -g "$(stat -c '%g' "$AGENT_CONF")" \\
-    -m "$(stat -c '%a' "$AGENT_CONF")" \\
-    "$TMP_AGENT_CONF" "$AGENT_CONF"
+  systemctl stop wazuh-agent
+  AGENT_SERVICE_STOPPED=1
+
+  # TMP_AGENT_CONF is created beside AGENT_CONF. Rename is atomic on the same
+  # filesystem and retains the owner/mode copied above.
+  mv -f -- "$TMP_AGENT_CONF" "$AGENT_CONF"
+  AGENT_CONFIG_REPLACED=1
 
   if ! /var/ossec/bin/wazuh-agentd -t; then
-    warn "Wazuh Agent configuration validation failed. Restoring original configuration."
-    cp -a "$BACKUP" "$AGENT_CONF"
-    systemctl start wazuh-agent 2>/dev/null || true
-    die "Invalid Agent configuration. Original ossec.conf restored from ${BACKUP}."
+    die "Invalid Agent configuration. The installer will restore the original ossec.conf."
   fi
 
   log "Agent configuration validated."
@@ -524,6 +547,8 @@ unset WAZUH_REGISTRATION_PASSWORD REG_PASSWORD
 sleep 3
 
 if systemctl is-active --quiet wazuh-agent; then
+  AGENT_SERVICE_STOPPED=0
+  AGENT_CONFIG_REPLACED=0
   log "Wazuh Agent service is active."
 else
   systemctl --no-pager --full status wazuh-agent || true
