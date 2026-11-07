@@ -6,7 +6,7 @@
 # Description : Generate a deployment bundle for enrolling Linux endpoints
 #               into the DefenseOps Wazuh Manager.
 #
-# Version     : 1.2.1
+# Version     : 1.2.2
 # Release     : 2026-11-07
 # Maintainer  : DefenseOps
 #
@@ -37,7 +37,7 @@
 # ============================================================================
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 SCRIPT_RELEASE="2026-11-07"
 OUT_DIR=""
 MANAGER_OVERRIDE=""
@@ -75,7 +75,7 @@ while (($#)); do
   case "$1" in
     -m|--manager) MANAGER_OVERRIDE="${2:?Missing manager address}"; shift 2 ;;
     -o|--output) OUT_DIR="${2:?Missing output directory}"; shift 2 ;;
-    -V|--version) printf 'DefenseOps Wazuh Agent Installer Generator v%s (%s)\\n' "$SCRIPT_VERSION" "$SCRIPT_RELEASE"; exit 0 ;;
+    -V|--version) printf 'DefenseOps Wazuh Agent Installer Generator v%s (%s)\n' "$SCRIPT_VERSION" "$SCRIPT_RELEASE"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)" ;;
   esac
@@ -126,7 +126,8 @@ mkdir -p "$OUT_DIR"
 chmod 0750 "$OUT_DIR"
 
 TMP_CONF="$(mktemp)"
-trap 'rm -f "$TMP_CONF"' EXIT
+TMP_ARCHIVE=""
+trap 'rm -f "$TMP_CONF" "${TMP_ARCHIVE:-}"' EXIT
 cat > "$TMP_CONF" <<EOF
 <ossec_config>
   <client>
@@ -588,6 +589,40 @@ Profile notes:
 EOF
 chmod 0640 "${OUT_DIR}/README.txt"
 
-log "Bundle generated. install-agent.sh is ONLY for Linux endpoints:"
-printf '  %s\n' "${OUT_DIR}/install-agent.sh" "${OUT_DIR}/profiles" "${OUT_DIR}/deploy-agent-profiles.sh" "${OUT_DIR}/README.txt"
+
+# Build a portable archive from an explicit file list. The temporary archive
+# is created inside OUT_DIR but is not included in itself; previous archives
+# are not included in subsequent archives either.
+command -v tar >/dev/null 2>&1 || die "tar is required to create the deployment archive."
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to create the archive checksum."
+
+ARCHIVE_STAMP="$(date +%Y%m%d-%H%M%S)"
+ARCHIVE_NAME="defenseops-agent-bundle-wazuh-${VERSION}-${ARCHIVE_STAMP}.tar.gz"
+ARCHIVE_PATH="${OUT_DIR}/${ARCHIVE_NAME}"
+CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
+TMP_ARCHIVE="$(mktemp "${OUT_DIR}/.defenseops-agent-bundle.XXXXXX")"
+
+tar -czf "$TMP_ARCHIVE" -C "$OUT_DIR" \\
+  install-agent.sh \\
+  ossec.conf \\
+  README.txt \\
+  profiles \\
+  deploy-agent-profiles.sh \\
+  enable-docker-listener.sh
+
+chmod 0640 "$TMP_ARCHIVE"
+mv -f "$TMP_ARCHIVE" "$ARCHIVE_PATH"
+TMP_ARCHIVE=""
+
+(
+  cd "$OUT_DIR"
+  sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+)
+chmod 0640 "$CHECKSUM_PATH"
+
+log "Deployment bundle generated:"
+printf '  Files   : %s\\n' "$OUT_DIR"
+printf '  Archive : %s\\n' "$ARCHIVE_PATH"
+printf '  SHA256  : %s\\n' "$CHECKSUM_PATH"
+log "Copy the .tar.gz archive to the endpoint, verify its checksum, extract it, then run install-agent.sh."
 log "No enrollment secret was copied or embedded."
