@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.3.4
+# Version     : 1.3.5
 # Release     : 2026-11-07
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.4"
-SCRIPT_RELEASE="2026-11-07"
+SCRIPT_VERSION="1.3.5"
+SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -143,14 +143,15 @@ cat > "$TMP_CONF" <<EOF
 EOF
 install -o root -g root -m 0640 "$TMP_CONF" "${OUT_DIR}/ossec.conf"
 
-# Endpoint-side installer. Existing vendor ossec.conf is retained. For
-# Brebes-WAF, only discovered log paths and /etc/nginx FIM are added after
-# backup, then validated before the Agent is started.
+# Endpoint-side installer. First-time installation enrolls a new Agent.
+# Existing installations are updated in place: active config is parsed and
+# only missing profile settings are merged; unrelated content is preserved.
 cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
+INSTALLER_VERSION="1.3.5"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -177,7 +178,8 @@ Options:
   -h, --help               Show help
 
 At runtime, select Brebes-WAF or Docker-PHP.
-Enrollment password is requested interactively and is never saved.
+First-time installation requests an enrollment password. Existing Agents are
+updated in place without re-enrollment or package reinstall.
 EOF
 }
 
@@ -199,8 +201,31 @@ command -v curl >/dev/null 2>&1 || die "curl is required."
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ -n "$CONFIG_FILE" ]] || CONFIG_FILE="${SCRIPT_DIR}/ossec.conf"
 
+command -v python3 >/dev/null 2>&1 || die "python3 is required for safe XML-aware configuration merging."
+
+AGENT_ALREADY_INSTALLED=0
+if command -v dpkg-query >/dev/null 2>&1 &&
+   dpkg-query -W -f='${Status}' wazuh-agent 2>/dev/null | grep -q 'install ok installed'; then
+  AGENT_ALREADY_INSTALLED=1
+elif command -v rpm >/dev/null 2>&1 && rpm -q wazuh-agent >/dev/null 2>&1; then
+  AGENT_ALREADY_INSTALLED=1
+fi
+
+ACTIVE_AGENT_CONF="/var/ossec/etc/ossec.conf"
+ACTIVE_MANAGER=""
+if (( AGENT_ALREADY_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
+  ACTIVE_MANAGER="$(sed -n 's:.*<address>\\([^<]*\\)</address>.*:\\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
+fi
+
+if (( AGENT_ALREADY_INSTALLED == 1 )); then
+  if [[ -n "$MANAGER" && -n "$ACTIVE_MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
+    die "Existing Agent uses Manager '${ACTIVE_MANAGER}'. Refusing to change it to '${MANAGER}' during profile update."
+  fi
+  [[ -n "$ACTIVE_MANAGER" ]] && MANAGER="$ACTIVE_MANAGER"
+fi
+
 if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
-  MANAGER="$(sed -n 's:.*<address>\(.*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
+  MANAGER="$(sed -n 's:.*<address>\\([^<]*\\)</address>.*:\\1:p' "$CONFIG_FILE" | head -n1)"
 fi
 [[ -n "$MANAGER" ]] || die "Manager address unavailable. Use --manager or provide ossec.conf."
 [[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address."
@@ -218,18 +243,17 @@ case "$profile_answer" in
   *) die "Invalid profile selection. Choose 1 or 2." ;;
 esac
 log "Selected endpoint profile: ${ENDPOINT_PROFILE}"
+log "DefenseOps installer version: ${INSTALLER_VERSION}"
 
-# Do not replace an existing Agent installation.
-if command -v dpkg-query >/dev/null 2>&1 &&
-   dpkg-query -W -f='${Status}' wazuh-agent 2>/dev/null | grep -q 'install ok installed'; then
-  die "wazuh-agent already installed; inspect the existing installation before proceeding."
-fi
-if command -v rpm >/dev/null 2>&1 && rpm -q wazuh-agent >/dev/null 2>&1; then
-  die "wazuh-agent already installed; inspect the existing installation before proceeding."
+if (( AGENT_ALREADY_INSTALLED == 1 )); then
+  log "Existing Wazuh Agent detected: update profile/configuration only."
+  log "Package installation, enrollment, Manager address, and client identity will be preserved."
+else
+  log "No existing Wazuh Agent detected: performing first-time installation and enrollment."
 fi
 
 # Time settings are opt-in. Do not overwrite chrony/timesyncd configuration.
-if command -v timedatectl >/dev/null 2>&1; then
+if (( AGENT_ALREADY_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1; then
   CURRENT_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
   echo "Current timezone: ${CURRENT_TZ:-unknown}"
   read -r -p "Change timezone to Asia/Jakarta? [y/N] " tz_answer
@@ -253,7 +277,7 @@ if command -v timedatectl >/dev/null 2>&1; then
       ;;
     *) log "NTP configuration unchanged." ;;
   esac
-else
+elif (( AGENT_ALREADY_INSTALLED == 0 )); then
   warn "timedatectl unavailable; timezone and NTP settings were not changed."
 fi
 
@@ -378,47 +402,49 @@ else
   log "Per-application monitoring will be registered later by create-php-app.sh."
 fi
 
-read -r -s -p "Enrollment password for DefenseOps: " REG_PASSWORD
-printf '\n'
-[[ -n "$REG_PASSWORD" ]] || die "Enrollment password cannot be empty."
-
+REG_PASSWORD=""
 cleanup(){
   unset REG_PASSWORD WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
 }
 trap cleanup EXIT
 
-export WAZUH_MANAGER="$MANAGER"
-export WAZUH_REGISTRATION_SERVER="$MANAGER"
-export WAZUH_MANAGER_PORT="$MANAGER_PORT"
-export WAZUH_REGISTRATION_PORT="$REG_PORT"
-export WAZUH_PROTOCOL="$PROTOCOL"
-export WAZUH_REGISTRATION_PASSWORD="$REG_PASSWORD"
-export WAZUH_AGENT_NAME="$AGENT_NAME"
-[[ -n "$AGENT_GROUP" ]] && export WAZUH_AGENT_GROUP="$AGENT_GROUP" || true
+if (( AGENT_ALREADY_INSTALLED == 0 )); then
+  read -r -s -p "Enrollment password for DefenseOps: " REG_PASSWORD
+  printf '\n'
+  [[ -n "$REG_PASSWORD" ]] || die "Enrollment password cannot be empty."
 
-[[ -r /etc/os-release ]] || die "Cannot identify Linux distribution."
-. /etc/os-release
+  export WAZUH_MANAGER="$MANAGER"
+  export WAZUH_REGISTRATION_SERVER="$MANAGER"
+  export WAZUH_MANAGER_PORT="$MANAGER_PORT"
+  export WAZUH_REGISTRATION_PORT="$REG_PORT"
+  export WAZUH_PROTOCOL="$PROTOCOL"
+  export WAZUH_REGISTRATION_PASSWORD="$REG_PASSWORD"
+  export WAZUH_AGENT_NAME="$AGENT_NAME"
+  [[ -n "$AGENT_GROUP" ]] && export WAZUH_AGENT_GROUP="$AGENT_GROUP" || true
 
-case "${ID:-}" in
-  ubuntu|debian|linuxmint|pop)
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y curl gnupg apt-transport-https
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
-      gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
-    chmod 0644 /usr/share/keyrings/wazuh.gpg
-    printf '%s\n' \
-      'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
-      > /etc/apt/sources.list.d/wazuh.list
-    apt-get update
-    apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
-    ;;
-  rhel|rocky|almalinux|centos|ol|fedora|amzn)
-    command -v rpm >/dev/null 2>&1 || die "rpm command not found."
-    rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
-    install -d -m 0755 /etc/yum.repos.d
-    cat > /etc/yum.repos.d/wazuh.repo <<'EOF'
+  [[ -r /etc/os-release ]] || die "Cannot identify Linux distribution."
+  . /etc/os-release
+
+  case "${ID:-}" in
+    ubuntu|debian|linuxmint|pop)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y curl gnupg apt-transport-https
+      install -d -m 0755 /usr/share/keyrings
+      curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
+        gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
+      chmod 0644 /usr/share/keyrings/wazuh.gpg
+      printf '%s\n' \
+        'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
+        > /etc/apt/sources.list.d/wazuh.list
+      apt-get update
+      apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
+      ;;
+    rhel|rocky|almalinux|centos|ol|fedora|amzn)
+      command -v rpm >/dev/null 2>&1 || die "rpm command not found."
+      rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+      install -d -m 0755 /etc/yum.repos.d
+      cat > /etc/yum.repos.d/wazuh.repo <<'EOF'
 [wazuh]
 gpgcheck=1
 gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
@@ -427,47 +453,68 @@ name=Wazuh repository
 baseurl=https://packages.wazuh.com/4.x/yum/
 priority=1
 EOF
-    if command -v dnf >/dev/null 2>&1; then
-      dnf install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
-    else
-      yum install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
-    fi
-    ;;
-  *)
-    die "Unsupported distribution: ${ID:-unknown}. Supported: Debian/Ubuntu and RHEL-compatible."
-    ;;
-esac
+      if command -v dnf >/dev/null 2>&1; then
+        dnf install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
+      else
+        yum install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
+      fi
+      ;;
+    *)
+      die "Unsupported distribution: ${ID:-unknown}. Supported: Debian/Ubuntu and RHEL-compatible."
+      ;;
+  esac
+else
+  log "Skipping package installation and enrollment; existing Agent identity is preserved."
+  unset REG_PASSWORD WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
+fi
 
 [[ -s /var/ossec/etc/ossec.conf ]] ||
   die "Wazuh package did not create /var/ossec/etc/ossec.conf."
 [[ -x /var/ossec/bin/wazuh-agentd ]] ||
   die "Wazuh Agent daemon binary not found."
 
-# Add only profile-specific local collection config. Keep the vendor file and
-# all existing settings; backup first, stage in the same directory, validate,
-# then atomically activate. Restore backup on validation failure.
+# Merge only DefenseOps-managed endpoint settings into the ACTIVE configuration.
+# Existing XML is parsed before any write; unrelated elements/comments remain
+# byte-for-byte in place. The merge is idempotent.
 AGENT_CONF="/var/ossec/etc/ossec.conf"
+[[ -s "$AGENT_CONF" ]] || die "Active Agent configuration is missing or empty."
+[[ ! -L "$AGENT_CONF" ]] || die "Active ossec.conf is a symlink; refusing an unsafe replacement."
+[[ -x /var/ossec/bin/wazuh-agentd ]] || die "Wazuh Agent daemon binary not found."
+
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP="${AGENT_CONF}.pre-defenseops-${ENDPOINT_PROFILE}.${STAMP}"
+BACKUP="${AGENT_CONF}.pre-defenseops-${ENDPOINT_PROFILE}.${STAMP}.$$"
 TMP_AGENT_CONF="$(mktemp "${AGENT_CONF}.tmp.XXXXXX")"
-PROFILE_BLOCK="$(mktemp)"
-# If anything fails after the service is stopped, restore the original
-# configuration (when replacement already happened) and start the Agent again.
-AGENT_SERVICE_STOPPED=0
+PATHS_FILE="$(mktemp)"
 AGENT_CONFIG_REPLACED=0
+AGENT_SERVICE_STOPPED=0
+WAS_AGENT_ACTIVE=0
+CONFIG_CHANGED=0
+
+if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
+  {
+    for path in "${!NGINX_LOGS[@]}"; do printf '%s\n' "$path"; done
+    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\n' "$path"; done
+  } | sort -u > "$PATHS_FILE"
+fi
+
 cleanup_files(){
   local exit_code=$?
   trap - EXIT
 
-  if (( exit_code != 0 && AGENT_SERVICE_STOPPED == 1 )); then
-    warn "Installer failed while the Agent service was stopped; performing rollback."
-    if (( AGENT_CONFIG_REPLACED == 1 )) && [[ -s "$BACKUP" ]]; then
-      if cp -a -- "$BACKUP" "$AGENT_CONF"; then
-        log "Original ossec.conf restored from ${BACKUP}."
-      else
-        warn "Could not restore ${BACKUP}; manual recovery is required."
-      fi
+  if (( exit_code != 0 && AGENT_CONFIG_REPLACED == 1 )); then
+    warn "Configuration activation failed; restoring the original ossec.conf."
+    local rollback_file="${AGENT_CONF}.rollback.$$"
+    if [[ -s "$BACKUP" ]] && cp -a -- "$BACKUP" "$rollback_file" &&
+       mv -f -- "$rollback_file" "$AGENT_CONF"; then
+      command -v restorecon >/dev/null 2>&1 && restorecon "$AGENT_CONF" >/dev/null 2>&1 || true
+      log "Original configuration restored from ${BACKUP}."
+    else
+      rm -f "$rollback_file"
+      warn "Automatic rollback failed. Original backup: ${BACKUP}"
     fi
+  fi
+
+  if (( exit_code != 0 && AGENT_SERVICE_STOPPED == 1 )); then
     if systemctl start wazuh-agent; then
       log "Wazuh Agent service started after rollback."
     else
@@ -475,81 +522,187 @@ cleanup_files(){
     fi
   fi
 
-  rm -f "${TMP_AGENT_CONF:-}" "${PROFILE_BLOCK:-}"
+  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}"
   cleanup
   exit "$exit_code"
 }
 trap cleanup_files EXIT
 
-if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
-  {
-    echo '<ossec_config>'
-    for path in "${!NGINX_LOGS[@]}"; do
-      escaped="${path//&/\\&amp;}"
-      printf '  <localfile><location>%s</location><log_format>syslog</log_format></localfile>\n' "$escaped"
-    done
-    for path in "${!MODSEC_LOGS[@]}"; do
-      escaped="${path//&/\\&amp;}"
-      printf '  <localfile><location>%s</location><log_format>syslog</log_format></localfile>\n' "$escaped"
-    done
-    echo '  <syscheck>'
-    echo '    <disabled>no</disabled>'
-    echo '    <frequency>43200</frequency>'
-    echo '    <scan_on_start>yes</scan_on_start>'
-    echo '    <directories realtime="yes">/etc/nginx</directories>'
-    echo '    <ignore type="sregex">.log$|.tmp$|.swp$</ignore>'
-    echo '  </syscheck>'
-    echo '</ossec_config>'
-  } > "$PROFILE_BLOCK"
+# Copy metadata first; the merge writes only file contents to this same-directory
+# staging file. The original remains untouched until all pre-activation checks pass.
+cp -a -- "$AGENT_CONF" "$TMP_AGENT_CONF"
 
-  cp -a "$AGENT_CONF" "$BACKUP"
-  {
-    cat "$AGENT_CONF"
-    printf '\n'
-    cat "$PROFILE_BLOCK"
-  } > "$TMP_AGENT_CONF"
-  chown --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
-  chmod --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
+python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" <<'PYMERGE'
+import html
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
-  systemctl stop wazuh-agent
-  AGENT_SERVICE_STOPPED=1
+source, destination, profile, paths_file = sys.argv[1:5]
+original = Path(source).read_text(encoding="utf-8")
+text = original
 
-  # TMP_AGENT_CONF is created beside AGENT_CONF. Rename is atomic on the same
-  # filesystem and retains the owner/mode copied above.
-  mv -f -- "$TMP_AGENT_CONF" "$AGENT_CONF"
-  AGENT_CONFIG_REPLACED=1
+# Wazuh supports multiple top-level <ossec_config> sections. Wrap them only
+# for validation; do not serialize through ElementTree, which would rewrite
+# comments, whitespace, and formatting in the user's active configuration.
+without_decl = re.sub(r"^\s*<\?xml[^?]*\?>", "", text, count=1)
+try:
+    parsed = ET.fromstring("<defenseops_validation_root>" + without_decl +
+                           "</defenseops_validation_root>")
+except ET.ParseError as exc:
+    raise SystemExit(f"Existing ossec.conf is not parseable; refusing to modify it: {exc}")
 
-  if ! /var/ossec/bin/wazuh-agentd -t; then
-    die "Invalid Agent configuration. The installer will restore the original ossec.conf."
+blocks = list(re.finditer(r"<ossec_config\b[^>]*>.*?</ossec_config\s*>",
+                          text, flags=re.DOTALL))
+if not blocks:
+    raise SystemExit("No <ossec_config> block found; refusing to modify the active file.")
+
+if profile == "brebes-waf":
+    paths = []
+    for raw in Path(paths_file).read_text(encoding="utf-8").splitlines():
+        path = raw.strip()
+        if path and path not in paths:
+            paths.append(path)
+
+    existing_locations = set()
+    for node in parsed.iter("localfile"):
+        location = node.find("location")
+        if location is not None and location.text:
+            existing_locations.add(location.text.strip())
+
+    additions = []
+    for path in paths:
+        if path in existing_locations:
+            continue
+        escaped = html.escape(path, quote=False)
+        additions.append(
+            "  <localfile>\n"
+            f"    <location>{escaped}</location>\n"
+            "    <log_format>syslog</log_format>\n"
+            "  </localfile>\n"
+        )
+
+    # Insert only missing localfile entries into the first ossec_config block.
+    if additions:
+        first = blocks[0]
+        close = re.search(r"</ossec_config\s*>", first.group(0))
+        insert_at = first.start() + close.start()
+        text = text[:insert_at] + "".join(additions) + text[insert_at:]
+
+    # Add /etc/nginx to an existing syscheck block without replacing any
+    # existing frequency, directories, ignores, nodiff, or synchronization.
+    nginx_already_watched = False
+    for node in parsed.iter("syscheck"):
+        for directory in node.findall("directories"):
+            if (directory.text or "").strip() == "/etc/nginx":
+                nginx_already_watched = True
+                break
+        if nginx_already_watched:
+            break
+
+    if not nginx_already_watched:
+        syscheck_match = re.search(r"<syscheck\b[^>]*>.*?</syscheck\s*>",
+                                   text, flags=re.DOTALL)
+        if syscheck_match:
+            closing = re.search(r"(?m)^([ \t]*)</syscheck\s*>", syscheck_match.group(0))
+            if closing:
+                indent = closing.group(1)
+                insert_at = syscheck_match.start() + closing.start()
+                text = (text[:insert_at] +
+                        indent + '  <directories realtime="yes">/etc/nginx</directories>\n' +
+                        text[insert_at:])
+            else:
+                raise SystemExit("Could not locate </syscheck>; refusing to modify configuration.")
+        else:
+            # No existing syscheck: create a minimal block; do not impose
+            # frequency/ignore settings on an endpoint that has none.
+            first = re.search(r"</ossec_config\s*>", text)
+            text = (text[:first.start()] +
+                    "  <syscheck>\n"
+                    '    <directories realtime="yes">/etc/nginx</directories>\n'
+                    "  </syscheck>\n" +
+                    text[first.start():])
+
+# Docker-PHP deliberately leaves the active local configuration unchanged.
+# Its per-application paths are managed by create-php-app.sh integration.
+try:
+    ET.fromstring("<defenseops_validation_root>" +
+                  re.sub(r"^\s*<\?xml[^?]*\?>", "", text, count=1) +
+                  "</defenseops_validation_root>")
+except ET.ParseError as exc:
+    raise SystemExit(f"Merged ossec.conf failed XML validation; no file activated: {exc}")
+
+Path(destination).write_text(text, encoding="utf-8")
+PYMERGE
+
+chown --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
+chmod --reference="$AGENT_CONF" "$TMP_AGENT_CONF"
+
+if cmp -s -- "$AGENT_CONF" "$TMP_AGENT_CONF"; then
+  CONFIG_CHANGED=0
+  rm -f "$TMP_AGENT_CONF"
+  log "Active ossec.conf already matches the selected profile; no file change required."
+else
+  CONFIG_CHANGED=1
+  cp -a -- "$AGENT_CONF" "$BACKUP"
+  WAS_AGENT_ACTIVE=0
+  if systemctl is-active --quiet wazuh-agent; then
+    WAS_AGENT_ACTIVE=1
+    systemctl stop wazuh-agent
+    AGENT_SERVICE_STOPPED=1
   fi
 
-  log "Agent configuration validated."
+  # Same-directory rename is atomic. The backup exists before activation.
+  mv -f -- "$TMP_AGENT_CONF" "$AGENT_CONF"
+  AGENT_CONFIG_REPLACED=1
+  command -v restorecon >/dev/null 2>&1 && restorecon "$AGENT_CONF" >/dev/null 2>&1 || true
+
+  if ! /var/ossec/bin/wazuh-agentd -t; then
+    die "Merged Agent configuration is invalid; original configuration will be restored."
+  fi
+  log "Merged Agent configuration passed wazuh-agentd validation."
+
+  if (( WAS_AGENT_ACTIVE == 1 )); then
+    systemctl start wazuh-agent
+    AGENT_SERVICE_STOPPED=1
+  elif (( AGENT_ALREADY_INSTALLED == 0 )); then
+    systemctl enable wazuh-agent
+    systemctl start wazuh-agent
+    AGENT_SERVICE_STOPPED=1
+  else
+    log "Agent was inactive before update; preserving its inactive state."
+  fi
+
+  if (( WAS_AGENT_ACTIVE == 1 || AGENT_ALREADY_INSTALLED == 0 )); then
+    sleep 3
+    systemctl is-active --quiet wazuh-agent ||
+      die "Wazuh Agent did not become active; original configuration will be restored."
+    AGENT_SERVICE_STOPPED=0
+  fi
   log "Original configuration backup: ${BACKUP}"
-else
-  # Docker-PHP does not collect unrelated containers or assume application
-  # paths. Keep the vendor configuration intact until create-php-app.sh
-  # registers concrete paths for an application it creates.
-  log "Docker-PHP selected: vendor ossec.conf will remain unchanged."
 fi
 
-# Keep package version aligned with the Manager release.
-if command -v apt-mark >/dev/null 2>&1; then
-  apt-mark hold wazuh-agent >/dev/null
-elif command -v dnf >/dev/null 2>&1; then
-  dnf versionlock add wazuh-agent >/dev/null 2>&1 ||
-    warn "Could not apply DNF versionlock; manage Agent updates manually."
+# Do not alter package hold/service enablement on an already-managed endpoint.
+if (( AGENT_ALREADY_INSTALLED == 0 )); then
+  if command -v apt-mark >/dev/null 2>&1; then
+    apt-mark hold wazuh-agent >/dev/null
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf versionlock add wazuh-agent >/dev/null 2>&1 ||
+      warn "Could not apply DNF versionlock; manage Agent updates manually."
+  fi
+  systemctl enable wazuh-agent
+  if ! systemctl is-active --quiet wazuh-agent; then
+    systemctl start wazuh-agent
+  fi
 fi
 
-systemctl daemon-reload
-systemctl enable wazuh-agent
-systemctl restart wazuh-agent
 unset WAZUH_REGISTRATION_PASSWORD REG_PASSWORD
-sleep 3
-
 if systemctl is-active --quiet wazuh-agent; then
   AGENT_SERVICE_STOPPED=0
-  AGENT_CONFIG_REPLACED=0
   log "Wazuh Agent service is active."
+elif (( AGENT_ALREADY_INSTALLED == 1 )); then
+  log "Wazuh Agent was inactive before profile update; its service state was preserved."
 else
   systemctl --no-pager --full status wazuh-agent || true
   die "Wazuh Agent did not become active. Check /var/ossec/logs/ossec.log."
@@ -557,8 +710,12 @@ fi
 
 log "Installed Wazuh Agent version: $(/var/ossec/bin/wazuh-agentd -V 2>&1 | head -n1 || true)"
 log "Endpoint profile: ${ENDPOINT_PROFILE}"
-log "Manager: ${MANAGER}:${MANAGER_PORT}/TCP; enrollment: ${MANAGER}:${REG_PORT}/TCP"
-log "Agent name: ${AGENT_NAME}"
+if (( AGENT_ALREADY_INSTALLED == 1 )); then
+  log "Manager and enrolled Agent identity: preserved (no re-enrollment)."
+else
+  log "Manager: ${MANAGER}:${MANAGER_PORT}/TCP; enrollment: ${MANAGER}:${REG_PORT}/TCP"
+  log "Agent name: ${AGENT_NAME}"
+fi
 if [[ "$ENDPOINT_PROFILE" == "docker-php" ]]; then
   log "Docker-PHP application monitoring is not yet registered."
   log "It will be integrated into create-php-app.sh / delete-php-app.sh."
@@ -663,9 +820,14 @@ Bundle:
   profiles/docker-php/agent.conf
   deploy-agent-profiles.sh
 
-Endpoint installation:
+Endpoint installation / profile update:
   sudo ./install-agent.sh [--name HOSTNAME]
   Select Brebes-WAF or Docker-PHP when prompted.
+
+  If Wazuh Agent is absent: installs and enrolls the Agent.
+  If Wazuh Agent is already installed: preserves package, Manager, client
+  identity, and unrelated configuration; merges only missing profile settings.
+  Existing installations are not re-enrolled or upgraded by package manager.
 
 Brebes-WAF:
   Discovery runs on the Brebes-WAF endpoint using nginx -T, which expands active
@@ -687,8 +849,10 @@ Time settings:
   It does not overwrite chrony/timesyncd configuration files.
 
 Security:
-  Enrollment password is requested interactively and is never stored in bundle.
-  Existing Agent installations are not overwritten.
+  Enrollment password is requested only for first-time installation and is
+  never stored in bundle. Existing Agent installations are not re-enrolled.
+  Configuration updates are idempotent, backed up, validated, and rolled back
+  on activation failure. Existing unrelated XML content is preserved.
 
 Central profiles:
   Publish explicitly with sudo ./deploy-agent-profiles.sh.
@@ -722,5 +886,5 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf, docker-php. Nginx discovery is endpoint-local."
+log "Profiles: brebes-waf, docker-php. Existing Agents are updated in place; no re-enrollment."
 log "No enrollment secret was copied or embedded."
