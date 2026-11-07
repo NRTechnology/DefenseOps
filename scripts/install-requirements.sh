@@ -131,6 +131,46 @@ configure_host_hostname() {
     ok "Hostname host: $(hostname)."
 }
 
+
+configure_time_and_timezone() {
+    log "Memastikan sinkronisasi waktu/NTP aktif..."
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true || warn "timedatectl tidak dapat mengaktifkan NTP; akan memeriksa chrony."
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files chrony.service >/dev/null 2>&1; then
+        systemctl enable --now chrony.service || warn "Layanan chrony gagal diaktifkan."
+    elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
+        systemctl enable --now systemd-timesyncd.service || warn "systemd-timesyncd gagal diaktifkan."
+    fi
+
+    local ntp_state sync_state
+    ntp_state="$(timedatectl show -p NTP --value 2>/dev/null || true)"
+    sync_state="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [[ "$ntp_state" == "yes" ]]; then
+        ok "NTP aktif (timedatectl NTP=yes; synchronized=${sync_state:-unknown})."
+    elif command -v chronyc >/dev/null 2>&1 && chronyc tracking >/dev/null 2>&1; then
+        ok "Chrony aktif; status sinkronisasi dapat diperiksa dengan: chronyc tracking."
+    else
+        warn "Status NTP belum dapat dipastikan. Periksa timedatectl status dan chronyc tracking."
+    fi
+
+    local current_tz answer
+    current_tz="$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+    printf '\\nZona waktu saat ini: %s\\n' "$current_tz"
+    read -r -p "Pindahkan timezone ke Asia/Jakarta (WIB)? [y/N]: " answer </dev/tty || answer=""
+    case "${answer,,}" in
+        y|yes|ya)
+            timedatectl set-timezone Asia/Jakarta
+            [[ "$(timedatectl show -p Timezone --value)" == "Asia/Jakarta" ]] || die "Gagal mengatur timezone Asia/Jakarta."
+            ok "Timezone diatur ke Asia/Jakarta."
+            ;;
+        *)
+            ok "Timezone dipertahankan: ${current_tz}."
+            ;;
+    esac
+}
+
 check_system_requirements() {
     log "Memeriksa system requirements DefenseOps..."
     [[ -r /etc/os-release ]] || die "/etc/os-release tidak ditemukan."
@@ -228,6 +268,7 @@ install_base_packages() {
         openssl rsync logrotate chrony vim htop net-tools iproute2 dnsutils \
         iputils-ping procps util-linux findutils software-properties-common python3 \
         python3-yaml
+    systemctl enable --now chrony.service || warn "Chrony belum berhasil diaktifkan; verifikasi NTP secara manual."
     ok "Paket dasar terpasang."
 }
 
@@ -1285,6 +1326,132 @@ rotate_wazuh_api_admin_password() {
     ok "Password default wazuh:wazuh berhasil dirotasi."
 }
 
+
+ensure_manager_agent_enrollment() {
+    log "Mengaktifkan enrollment password dan memastikan konfigurasi Manager persisten..."
+
+    local manager_conf="${WAZUH_CONFIG}/wazuh_cluster/wazuh_manager.conf"
+    local secret_file="${DEFENSEOPS_ROOT}/secrets/wazuh-agent-enrollment.pass"
+    [[ -s "$manager_conf" ]] || die "Konfigurasi Manager tidak ditemukan: ${manager_conf}"
+
+    install -d -o root -g root -m 0700 "${DEFENSEOPS_ROOT}/secrets"
+    if [[ ! -s "$secret_file" ]]; then
+        umask 077
+        openssl rand -hex 32 > "$secret_file"
+        log "Enrollment password baru dibuat."
+    else
+        log "Enrollment password yang sudah ada dipertahankan."
+    fi
+    chown root:root "$secret_file"
+    chmod 0600 "$secret_file"
+
+    # Ensure the bind-mounted source config requests password-protected enrollment.
+    MANAGER_CONF="$manager_conf" python3 <<'PYAUTH'
+import os, re
+from pathlib import Path
+
+p = Path(os.environ["MANAGER_CONF"])
+s = p.read_text(encoding="utf-8")
+auth = re.search(r"(?ms)(<auth>)(.*?)(</auth>)", s)
+if not auth:
+    raise SystemExit(f"Blok <auth> tidak ditemukan dalam {p}")
+block = auth.group(2)
+rx = re.compile(r"(?m)^([ \t]*<use_password>)[^<]*(</use_password>[ \t]*)$")
+if rx.search(block):
+    block = rx.sub(r"\g<1>yes\g<2>", block, count=1)
+else:
+    block += "\n    <use_password>yes</use_password>\n  "
+s = s[:auth.start(2)] + block + s[auth.end(2):]
+p.write_text(s, encoding="utf-8")
+PYAUTH
+
+    # The effective ossec.conf is stored in the named Docker volume, not in
+    # /wazuh-config-mount. Update that persistent volume after Compose creates it.
+    local volume_name="defenseops-manager-wazuh_etc"
+    local volume_mount=""
+    volume_mount="$(docker volume inspect -f '{{.Mountpoint}}' "$volume_name" 2>/dev/null || true)"
+    if [[ -z "$volume_mount" || ! -d "$volume_mount" ]]; then
+        die "Docker volume ${volume_name} belum tersedia; Manager harus dibuat terlebih dahulu."
+    fi
+
+    local effective_conf="${volume_mount}/ossec.conf"
+    [[ -s "$effective_conf" ]] || die "ossec.conf persisten tidak ditemukan: ${effective_conf}"
+    cp -a "$effective_conf" "${effective_conf}.defenseops-backup-$(date +%Y%m%d-%H%M%S)"
+
+    EFFECTIVE_CONF="$effective_conf" python3 <<'PYVOL'
+import os, re
+from pathlib import Path
+
+p = Path(os.environ["EFFECTIVE_CONF"])
+s = p.read_text(encoding="utf-8")
+auth = re.search(r"(?ms)(<auth>)(.*?)(</auth>)", s)
+if not auth:
+    raise SystemExit(f"Blok <auth> tidak ditemukan dalam {p}")
+block = auth.group(2)
+rx = re.compile(r"(?m)^([ \t]*<use_password>)[^<]*(</use_password>[ \t]*)$")
+if rx.search(block):
+    block = rx.sub(r"\g<1>yes\g<2>", block, count=1)
+else:
+    block += "\n    <use_password>yes</use_password>\n  "
+s = s[:auth.start(2)] + block + s[auth.end(2):]
+p.write_text(s, encoding="utf-8")
+PYVOL
+
+    # Wazuh authd reads this file from the same persistent /var/ossec/etc volume.
+    local restart_needed=0
+    if [[ ! -s "${volume_mount}/authd.pass" ]] || ! cmp -s "$secret_file" "${volume_mount}/authd.pass"; then
+        restart_needed=1
+    fi
+    local container_id wazuh_gid
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Manager tidak ditemukan setelah volume dibuat."
+    wazuh_gid="$(docker exec "$container_id" getent group wazuh | cut -d: -f3)"
+    [[ "$wazuh_gid" =~ ^[0-9]+$ ]] || die "GID grup wazuh tidak dapat dideteksi dari container."
+    install -o root -g "$wazuh_gid" -m 0640 "$secret_file" "${volume_mount}/authd.pass"
+
+    local active_value
+    active_value="$(docker exec "$container_id" python3 -c '
+import re
+from pathlib import Path
+s=Path("/var/ossec/etc/ossec.conf").read_text()
+m=re.search(r"(?ms)<auth>(.*?)</auth>",s)
+v=re.search(r"<use_password>\s*(.*?)\s*</use_password>",m.group(1)) if m else None
+print(v.group(1) if v else "missing")
+' 2>/dev/null || true)"
+
+    if [[ "$active_value" != "yes" ]]; then
+        restart_needed=1
+    fi
+    if (( restart_needed )); then
+        log "Menerapkan konfigurasi enrollment/password ke Manager; container akan direstart satu kali."
+        docker restart "$container_id" >/dev/null
+        wait_for_manager
+    fi
+
+    # Re-read the active config after any restart and validate the authd listener.
+    active_value="$(docker exec "$container_id" python3 -c '
+import re
+from pathlib import Path
+s=Path("/var/ossec/etc/ossec.conf").read_text()
+m=re.search(r"(?ms)<auth>(.*?)</auth>",s)
+v=re.search(r"<use_password>\s*(.*?)\s*</use_password>",m.group(1)) if m else None
+print(v.group(1) if v else "missing")
+' 2>/dev/null || true)"
+    [[ "$active_value" == "yes" ]] || die "Konfigurasi aktif Manager belum menunjukkan use_password=yes."
+
+    docker exec "$container_id" test -s /var/ossec/etc/authd.pass \
+        || die "authd.pass tidak ditemukan di volume aktif Manager."
+    docker exec "$container_id" sh -c 'test "$(stat -c "%a" /var/ossec/etc/authd.pass)" = 640' \
+        || die "Permission authd.pass bukan 0640."
+    docker exec "$container_id" pgrep -x wazuh-authd >/dev/null \
+        || die "Proses wazuh-authd tidak berjalan."
+    if ! ss -lnt 2>/dev/null | awk '$4 ~ /:1515$/ {found=1} END {exit !found}'; then
+        die "Port enrollment TCP 1515 tidak listening pada host."
+    fi
+
+    ok "Enrollment password aktif; use_password=yes persisten, authd.pass tersimpan aman, dan TCP 1515 listening."
+}
+
 deploy_wazuh() {
     log "Menyiapkan deployment Wazuh ${WAZUH_VERSION}..."
     create_docker_network
@@ -1308,6 +1475,7 @@ deploy_wazuh() {
 
     log "Menjalankan Wazuh Manager..."
     compose_up manager
+    ensure_manager_agent_enrollment
     wait_for_manager
     configure_manager_api_tls
     rotate_wazuh_api_admin_password
@@ -1318,6 +1486,59 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Dashboard..."
     compose_up dashboard
     wait_for_dashboard
+}
+
+
+check_component_communications() {
+    log "Memeriksa komunikasi antar-komponen Wazuh..."
+    local dashboard_id manager_id indexer_id
+    dashboard_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-dashboard' | head -n 1)"
+    manager_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    indexer_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-indexer' | head -n 1)"
+    [[ -n "$dashboard_id" && -n "$manager_id" && -n "$indexer_id" ]] || die "Salah satu container Wazuh tidak berjalan."
+
+    local result
+    result="$(curl -kfsS --connect-timeout 5 --max-time 15 \
+        -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
+        https://127.0.0.1:9200/_cluster/health 2>/dev/null)" \
+        || die "Host -> Indexer API gagal."
+    printf '%s' "$result" | jq -e '.status == "green" or .status == "yellow"' >/dev/null \
+        || die "Indexer cluster health bukan green/yellow."
+    ok "Host -> Indexer API: OK (cluster $(printf '%s' "$result" | jq -r '.status'))."
+
+    local dashboard_http
+    dashboard_http="$(curl -k -sS --connect-timeout 5 --max-time 15 \
+        -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/app/login 2>/dev/null || true)"
+    [[ "$dashboard_http" =~ ^(200|302)$ ]] || die "Dashboard UI gagal (HTTP ${dashboard_http})."
+    ok "Host -> Dashboard UI: OK (HTTP ${dashboard_http})."
+
+    # Dashboard container -> Indexer (TLS + authentication).
+    docker exec -e CHECK_USER="$WAZUH_DASHBOARD_USERNAME" \
+        -e CHECK_PASS="$WAZUH_DASHBOARD_PASSWORD" "$dashboard_id" sh -c '
+        curl -kfsS --connect-timeout 5 --max-time 15 \
+          -u "$CHECK_USER:$CHECK_PASS" https://wazuh.indexer:9200/_cluster/health >/dev/null
+    ' || die "Dashboard -> Indexer gagal."
+    ok "Dashboard -> Indexer: OK (HTTPS + authentication)."
+
+    # Dashboard container -> Manager API (TLS + API authentication).
+    docker exec -e CHECK_USER="$WAZUH_MANAGER_API_USERNAME" \
+        -e CHECK_PASS="$WAZUH_MANAGER_API_PASSWORD" "$dashboard_id" sh -c '
+        code=$(curl -k -sS --connect-timeout 5 --max-time 15 -o /dev/null -w "%{http_code}" \
+          -u "$CHECK_USER:$CHECK_PASS" \
+          -X POST "https://wazuh.manager:55000/security/user/authenticate?raw=true")
+        [ "$code" = 200 ]
+    ' || die "Dashboard -> Manager API gagal."
+    ok "Dashboard -> Manager API: OK (HTTPS + authentication)."
+
+    # Manager container -> Indexer (TLS + authentication).
+    docker exec -e CHECK_USER="$WAZUH_DASHBOARD_USERNAME" \
+        -e CHECK_PASS="$WAZUH_DASHBOARD_PASSWORD" "$manager_id" sh -c '
+        curl -kfsS --connect-timeout 5 --max-time 15 \
+          -u "$CHECK_USER:$CHECK_PASS" https://wazuh.indexer:9200/_cluster/health >/dev/null
+    ' || die "Manager -> Indexer gagal."
+    ok "Manager -> Indexer: OK (HTTPS + authentication)."
+
+    ok "Seluruh pemeriksaan komunikasi komponen berhasil."
 }
 
 verify_final_state() {
@@ -1338,7 +1559,7 @@ verify_final_state() {
 
 print_installation_summary() {
     local primary_ip="" dashboard_url="" credentials_mode="" docker_version="" compose_version=""
-    local host_name="" os_name="" container_status=""
+    local host_name="" os_name="" container_status="" ntp_state="" sync_state="" timezone="" enrollment_state=""
 
     # Prefer the source address selected by the host's default route.
     primary_ip="$(ip -4 route get 1.1.1.1 2>/dev/null |
@@ -1362,6 +1583,15 @@ print_installation_summary() {
 
     docker_version="$(docker --version 2>/dev/null || true)"
     compose_version="$(docker compose version --short 2>/dev/null || docker compose version 2>/dev/null || true)"
+    ntp_state="$(timedatectl show -p NTP --value 2>/dev/null || printf 'unknown')"
+    sync_state="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || printf 'unknown')"
+    timezone="$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+    enrollment_state="$(docker exec defenseops-manager-wazuh.manager-1 python3 -c 'import re; s=open("/var/ossec/etc/ossec.conf").read(); m=re.search(r"(?ms)<auth>(.*?)</auth>",s); v=re.search(r"<use_password>\s*(.*?)\s*</use_password>",m.group(1)) if m else None; print(v.group(1) if v else "missing")' 2>/dev/null || printf 'check-failed')"
+    if [[ "$enrollment_state" == "yes" ]]; then
+        enrollment_state="enabled (yes)"
+    else
+        enrollment_state="NOT ENABLED (${enrollment_state})"
+    fi
 
     if [[ -f "$CREDENTIALS_FILE" ]]; then
         credentials_mode="$(stat -c '%a (%A)' "$CREDENTIALS_FILE" 2>/dev/null || printf 'unknown')"
@@ -1380,6 +1610,8 @@ print_installation_summary() {
     printf 'Docker Engine         : %s\n' "${docker_version:-not detected}"
     printf 'Docker Compose        : %s\n' "${compose_version:-not detected}"
     printf 'Wazuh Version         : %s\n' "$WAZUH_VERSION"
+    printf 'Timezone              : %s\n' "$timezone"
+    printf 'NTP                   : enabled=%s, synchronized=%s\n' "$ntp_state" "$sync_state"
 
     printf '\n%b[ WAZUH DASHBOARD ]%b\n' "$BLUE" "$NC"
     printf 'Dashboard URL         : %s\n' "$dashboard_url"
@@ -1387,6 +1619,13 @@ print_installation_summary() {
     printf '\n'
     printf "Dashboard Username    : %s\n" "${WAZUH_DASHBOARD_USERNAME:-admin}"
     printf 'Dashboard Password    : WAZUH_DASHBOARD_PASSWORD in credentials file\n'
+
+    printf '\n%b[ AGENT ENROLLMENT ]%b\n' "$BLUE" "$NC"
+    printf 'Enrollment Password   : %s\n' "${DEFENSEOPS_ROOT}/secrets/wazuh-agent-enrollment.pass"
+    printf 'Secret Permission     : %s\n' "$(stat -c '%a (%A)' "${DEFENSEOPS_ROOT}/secrets/wazuh-agent-enrollment.pass" 2>/dev/null || printf MISSING)"
+    printf 'Manager use_password  : %s\n' "$enrollment_state"
+    printf 'Persistent authd.pass : %s\n' "$(docker exec defenseops-manager-wazuh.manager-1 test -s /var/ossec/etc/authd.pass && printf OK || printf MISSING)"
+    printf 'Enrollment Listener   : %s\n' "$(ss -lnt 2>/dev/null | awk '$4 ~ /:1515$/ {found=1} END {print found ? "1515/TCP LISTENING" : "NOT LISTENING"}')"
 
     printf '\n%b[ LOG COLLECTION & RETENTION ]%b\n' "$BLUE" "$NC"
     printf 'Raw JSON Events       : enabled\n'
@@ -1414,6 +1653,13 @@ print_installation_summary() {
     printf 'Wazuh Agent           : 1514/TCP\n'
     printf 'Agent Enrollment      : 1515/TCP\n'
     printf 'Syslog                : 514/UDP\n'
+
+    printf '\n%b[ COMPONENT COMMUNICATION ]%b\n' "$BLUE" "$NC"
+    printf 'Dashboard -> Indexer   : OK (HTTPS + authentication)\n'
+    printf 'Dashboard -> Manager   : OK (HTTPS + authentication)\n'
+    printf 'Manager -> Indexer      : OK (HTTPS + authentication)\n'
+    printf 'Host -> Dashboard       : OK (HTTP 200/302)\n'
+    printf 'Host -> Indexer         : OK (cluster health checked)\n'
 
     printf '\n%b[ SERVICE STATUS ]%b\n' "$BLUE" "$NC"
     docker ps --filter "label=com.defenseops.managed=true" \
@@ -1450,18 +1696,22 @@ main() {
         log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> Manager API TLS -> health checks."
         log "Raw JSON events -> Indexer ISM retention (raw 30d, alerts 90d) ->"
         log "Manager local compressed archives cleanup (14d)."
+        log "NTP/chrony -> optional timezone Asia/Jakarta -> enrollment password use_password=yes in persistent wazuh_etc volume."
+        log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
         exit 0
     fi
 
     configure_host_hostname
     configure_ubuntu_repositories
     install_base_packages
+    configure_time_and_timezone
     install_docker
     configure_docker_defaults
     configure_kernel
     create_directories
     deploy_wazuh
     verify_final_state
+    check_component_communications
 
     print_installation_summary
 }
