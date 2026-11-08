@@ -679,11 +679,58 @@ PYFILEBEAT
         # Restart only the supervised Filebeat service; keep Manager, agents,
         # Indexer and Dashboard processes untouched.
         docker exec "$container_id" sh -c '
-            command -v s6-svc >/dev/null 2>&1 || exit 20
-            test -d /run/service/filebeat || exit 21
-            s6-svc -r /run/service/filebeat
-        ' || die "Konfigurasi sudah tersimpan, tetapi Filebeat saja tidak dapat direstart melalui s6. Tidak ada restart container yang dilakukan. Periksa service supervisor secara manual."
-        log "Filebeat service direstart tanpa me-restart container Manager."
+            set -eu
+            command -v s6-svc >/dev/null 2>&1 || {
+                echo "s6-svc tidak ditemukan." >&2
+                exit 20
+            }
+
+            # Wazuh Manager 4.14.10 uses s6-overlay v2. Its service
+            # supervision directory is /run/s6/services, not /run/service.
+            service_dir=""
+            for candidate in \
+                /run/s6/services/filebeat \
+                /var/run/s6/services/filebeat \
+                /run/service/filebeat; do
+                if [ -d "$candidate" ]; then
+                    service_dir="$candidate"
+                    break
+                fi
+            done
+            [ -n "$service_dir" ] || {
+                echo "Direktori service Filebeat tidak ditemukan." >&2
+                exit 21
+            }
+
+            old_pid="$(pgrep -xo filebeat || true)"
+            [ -n "$old_pid" ] || {
+                echo "Proses Filebeat belum berjalan sebelum restart." >&2
+                exit 22
+            }
+
+            s6-svc -r "$service_dir"
+
+            # Wait until s6 has replaced the Filebeat process. Do not restart
+            # the Manager container or any other Wazuh component.
+            new_pid=""
+            attempt=0
+            while [ "$attempt" -lt 30 ]; do
+                new_pid="$(pgrep -xo filebeat || true)"
+                if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ]; then
+                    break
+                fi
+                sleep 1
+                attempt=$((attempt + 1))
+            done
+
+            [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] || {
+                echo "PID Filebeat tidak berubah setelah perintah restart s6." >&2
+                exit 23
+            }
+            kill -0 "$new_pid"
+            echo "Filebeat restarted: PID $old_pid -> $new_pid (service: $service_dir)"
+        ' || die "Konfigurasi sudah tersimpan, tetapi restart service Filebeat gagal. Container Manager tidak direstart. Periksa service supervisor secara manual."
+        log "Filebeat service berhasil direstart secara terpisah; container Manager tetap berjalan."
     else
         log "archives.enabled sudah true; tidak ada perubahan atau restart dilakukan."
     fi
