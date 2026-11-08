@@ -480,7 +480,7 @@ seed_wazuh_configuration() {
     # configuration just because one other file is missing.
     install -d -m 0750 "$WAZUH_CONFIG"
     log "Memastikan seluruh konfigurasi dasar Wazuh tersedia..."
-    cp -a -n "${upstream_config}/." "${WAZUH_CONFIG}/"
+    cp -a --update=none "${upstream_config}/." "${WAZUH_CONFIG}/"
 
     # In the official Wazuh Docker release, opensearch.yml is sourced from the
     # Indexer image build configuration, not necessarily from single-node/config.
@@ -516,7 +516,7 @@ seed_wazuh_configuration() {
         )
         install -d -m 0750 "$target_cert_dir"
         if [[ -d "$upstream_cert_dir" ]]; then
-            cp -a -n "${upstream_cert_dir}/." "${target_cert_dir}/"
+            cp -a --update=none "${upstream_cert_dir}/." "${target_cert_dir}/"
         fi
     else
         log "Sertifikat Wazuh yang sudah ada dipertahankan; memeriksa permission dan ownership."
@@ -575,8 +575,8 @@ configure_indexer_retention_policies() {
         status="${existing##*$'\n'}"
         if [[ "$status" == "200" ]]; then
             existing="${existing%$'\n'*}"
-            seq_no="$(printf '%s' "$existing" | jq -r '.policy_seq_no // empty')"
-            primary_term="$(printf '%s' "$existing" | jq -r '.policy_primary_term // empty')"
+            seq_no="$(printf '%s' "$existing" | jq -r '._seq_no // empty')"
+            primary_term="$(printf '%s' "$existing" | jq -r '._primary_term // empty')"
             [[ "$seq_no" =~ ^[0-9]+$ && "$primary_term" =~ ^[0-9]+$ ]] || die "Metadata policy ${policy_id} tidak valid; menolak overwrite tanpa concurrency control."
             endpoint="${endpoint}?if_seq_no=${seq_no}&if_primary_term=${primary_term}"
         elif [[ "$status" != "404" ]]; then
