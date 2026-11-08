@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.3.5
+# Version     : 1.3.6
 # Release     : 2026-11-07
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.3.6"
 SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.3.5"
+INSTALLER_VERSION="1.3.6"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -252,6 +252,227 @@ else
   log "No existing Wazuh Agent detected: performing first-time installation and enrollment."
 fi
 
+# ---------------------------------------------------------------------------
+# Brebes-WAF endpoint-local discovery. nginx -T expands active include files,
+# so discovery is performed on the WAF host, not on the DefenseOps generator.
+# ---------------------------------------------------------------------------
+declare -A NGINX_ACCESS_LOGS=()
+declare -A NGINX_ERROR_LOGS=()
+declare -A MODSEC_LOGS=()
+declare -A SEEN_MODSEC=()
+NGINX_DUMP=""
+DISCOVERY_REPORT=""
+
+trim_directive_value(){
+  local value="$1"
+  value="${value%%#*}"; value="${value%;}"
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  printf '%s' "$value"
+}
+add_modsec_path(){
+  local value="$1"
+  [[ -n "$value" ]] || return 0
+  [[ "$value" == /* && "$value" != *'$'* && "$value" != *' '* ]] || return 0
+  MODSEC_LOGS["$value"]=1
+}
+discover_modsecurity_file(){
+  local initial="$1"; local -a queue=()
+  local current line directive value base expanded
+  queue+=("$initial")
+  while ((${#queue[@]})); do
+    current="${queue[0]}"; queue=("${queue[@]:1}")
+    [[ -r "$current" && -f "$current" ]] || continue
+    [[ -n "${SEEN_MODSEC[$current]:-}" ]] && continue
+    SEEN_MODSEC["$current"]=1; base="$(dirname -- "$current")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      read -r directive value _ <<< "$line"
+      [[ -n "${directive:-}" && -n "${value:-}" ]] || continue
+      value="$(trim_directive_value "$value")"
+      case "$directive" in
+        SecAuditLog|SecDebugLog) add_modsec_path "$value" ;;
+        Include)
+          [[ "$value" != /* ]] && value="${base}/${value}"
+          if [[ "$value" == *'*'* || "$value" == *'?'* || "$value" == *'['* ]]; then
+            while IFS= read -r expanded; do
+              [[ -n "$expanded" && -f "$expanded" ]] && queue+=("$expanded")
+            done < <(compgen -G "$value" || true)
+          elif [[ -f "$value" ]]; then queue+=("$value")
+          fi
+          ;;
+      esac
+    done < "$current"
+  done
+}
+
+discover_brebes_waf(){
+  local dump_file report_file
+  command -v nginx >/dev/null 2>&1 || die "Brebes-WAF profile selected, but nginx command was not found."
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for reliable Nginx virtual-host/log-format discovery."
+  dump_file="$(mktemp)"; report_file="$(mktemp)"
+  NGINX_DUMP="$dump_file"; DISCOVERY_REPORT="$report_file"
+  if ! nginx -T >"$dump_file" 2>&1; then
+    cat "$dump_file" >&2
+    die "nginx -T failed. Fix/check Nginx configuration before installing the WAF profile."
+  fi
+
+  if ! python3 - "$dump_file" "$report_file" <<'PYNGINX'
+import re, sys
+from pathlib import Path
+source, report = sys.argv[1:3]
+text = Path(source).read_text(encoding="utf-8", errors="replace")
+token_re = re.compile(r"""(?xs)\s+|\#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[;{}]|[^\s;{}#]+""")
+tokens = []
+for m in token_re.finditer(text):
+    t = m.group(0)
+    if not t or t.isspace() or t.startswith("#"): continue
+    if t[0:1] in ("'", '"') and t[-1:] == t[0]: t = t[1:-1]
+    tokens.append(t)
+
+class Node:
+    def __init__(self, name, args=None, parent=None):
+        self.name, self.args, self.parent = name, args or [], parent
+        self.directives, self.children = [], []
+
+def parse_context(i=0, parent=None):
+    node = parent or Node("root")
+    while i < len(tokens):
+        words = []
+        while i < len(tokens) and tokens[i] not in (";", "{", "}"):
+            words.append(tokens[i]); i += 1
+        if i >= len(tokens):
+            if words: raise ValueError("directive without ';' at end")
+            break
+        marker = tokens[i]; i += 1
+        if marker == "}":
+            if words: raise ValueError("unexpected '}'")
+            return node, i
+        if not words: raise ValueError("empty directive/context")
+        if marker == ";": node.directives.append((words[0], words[1:]))
+        else:
+            child = Node(words[0], words[1:], node)
+            child, i = parse_context(i, child)
+            node.children.append(child)
+    if parent is not None: raise ValueError("unclosed configuration context")
+    return node, i
+
+def walk(n):
+    yield n
+    for c in n.children: yield from walk(c)
+def direct(n, name):
+    return [args for key, args in n.directives if key == name]
+
+try: root, _ = parse_context()
+except Exception as e:
+    print(f"[ERROR] Cannot parse expanded Nginx configuration: {e}", file=sys.stderr); sys.exit(2)
+
+http_nodes = [n for n in walk(root) if n.name == "http"]
+if not http_nodes:
+    print("[ERROR] No http {} context found.", file=sys.stderr); sys.exit(2)
+http = http_nodes[0]
+formats = {}
+for args in direct(http, "log_format"):
+    if len(args) < 2: continue
+    name, rest = args[0], args[1:]
+    escaped = any(x.lower() == "escape=json" for x in rest)
+    body = " ".join(x for x in rest if not x.lower().startswith("escape="))
+    formats[name] = bool(escaped and "{" in body and "}" in body and re.search(r'"[^"]+"\s*:', body))
+
+http_access = direct(http, "access_log")
+servers = [n for n in walk(http) if n.name == "server"]
+if not servers:
+    print("[ERROR] No server {} virtual-host blocks found.", file=sys.stderr); sys.exit(2)
+
+rows, failures = [], []
+for idx, server in enumerate(servers, 1):
+    names = [x for args in direct(server, "server_name") for x in args]
+    vhost = ",".join(names) if names else f"<server-block-{idx}-without-server_name>"
+    root_access = direct(server, "access_log")
+    nested_access = [a for child in server.children for n in walk(child) for a in direct(n, "access_log")]
+    effective = ([] if root_access else list(http_access)) + root_access + nested_access
+    if not effective:
+        failures.append((vhost, "<default Nginx access log>", "no explicit access_log; default format is not verified as JSON"))
+        continue
+    for args in effective:
+        if not args:
+            failures.append((vhost, "<unknown>", "empty access_log directive")); continue
+        path = args[0]
+        if path == "off":
+            failures.append((vhost, "off", "access logging disabled for this context")); continue
+        if not path.startswith("/") or "$" in path or " " in path:
+            failures.append((vhost, path, "dynamic/non-file access_log path cannot be monitored safely")); continue
+        fmt = args[1] if len(args) >= 2 else "combined"
+        if fmt.startswith(("buffer=", "gzip=", "flush=", "if=")):
+            fmt = "combined"
+        if not formats.get(fmt, False):
+            failures.append((vhost, path, f"format '{fmt}' is not verified JSON (requires escape=json and JSON object)"))
+        else: rows.append((vhost, path, "json", fmt))
+
+http_errors = direct(http, "error_log")
+for idx, server in enumerate(servers, 1):
+    names = [x for args in direct(server, "server_name") for x in args]
+    vhost = ",".join(names) if names else f"<server-block-{idx}-without-server_name>"
+    own_errors = [a for n in walk(server) for a in direct(n, "error_log")]
+    if not own_errors: own_errors = http_errors
+    for args in own_errors:
+        if not args: continue
+        path = args[0]
+        if path in ("stderr", "syslog") or path.startswith("syslog:"): continue
+        if path.startswith("/") and "$" not in path and " " not in path:
+            rows.append((vhost, path, "syslog", "nginx-error"))
+
+if failures:
+    print("[ERROR] Brebes-WAF JSON access-log validation failed:", file=sys.stderr)
+    for vhost, path, reason in failures:
+        print(f"  VHOST: {vhost}\n  PATH : {path}\n  WHY  : {reason}", file=sys.stderr)
+    print("[ERROR] Fix every listed virtual host and rerun install-agent.sh.", file=sys.stderr)
+    sys.exit(3)
+
+seen = set()
+with open(report, "w", encoding="utf-8") as f:
+    for row in rows:
+        if row not in seen:
+            seen.add(row); f.write("\t".join(row) + "\n")
+print(f"[INFO] Nginx virtual hosts checked: {len(servers)}")
+print(f"[INFO] Verified JSON access-log entries: {sum(1 for r in rows if r[2] == 'json')}")
+print(f"[INFO] Nginx error-log entries: {sum(1 for r in rows if r[2] == 'syslog')}")
+PYNGINX
+  then
+    rm -f "$dump_file" "$report_file"
+    NGINX_DUMP=""; DISCOVERY_REPORT=""
+    die "Brebes-WAF validation failed. No Agent installation or configuration changes were made."
+  fi
+
+  local vhost path format kind
+  while IFS=$'\t' read -r vhost path format kind; do
+    [[ -n "$path" ]] || continue
+    if [[ "$kind" == "json" ]]; then NGINX_ACCESS_LOGS["$path"]=json
+    else NGINX_ERROR_LOGS["$path"]=syslog
+    fi
+  done < "$report_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    read -r directive value _ <<< "$line"
+    [[ "${directive:-}" == "modsecurity_rules_file" && -n "${value:-}" ]] || continue
+    value="$(trim_directive_value "$value")"
+    [[ "$value" == /* && -r "$value" ]] && discover_modsecurity_file "$value"
+  done < "$dump_file"
+
+  ((${#NGINX_ACCESS_LOGS[@]} > 0)) || die "No verified JSON Nginx access logs found. Agent installation aborted."
+  log "Nginx discovery: ${#NGINX_ACCESS_LOGS[@]} JSON access log(s), ${#NGINX_ERROR_LOGS[@]} text error log(s), ${#MODSEC_LOGS[@]} ModSecurity log(s)."
+}
+if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
+  log "Inspecting every active Nginx virtual host and validating JSON access logs..."
+  discover_brebes_waf
+  log "Brebes-WAF JSON validation passed."
+else
+  log "Docker-PHP base profile selected."
+  log "No global Docker container logs will be collected."
+  log "Per-application monitoring will be registered later by create-php-app.sh."
+fi
+
 # Time settings are opt-in. Do not overwrite chrony/timesyncd configuration.
 if (( AGENT_ALREADY_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1; then
   CURRENT_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
@@ -279,127 +500,6 @@ if (( AGENT_ALREADY_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1;
   esac
 elif (( AGENT_ALREADY_INSTALLED == 0 )); then
   warn "timedatectl unavailable; timezone and NTP settings were not changed."
-fi
-
-# ---------------------------------------------------------------------------
-# Brebes-WAF endpoint-local discovery. nginx -T expands active include files,
-# so discovery is performed on the WAF host, not on the DefenseOps generator.
-# ---------------------------------------------------------------------------
-declare -A NGINX_LOGS=()
-declare -A MODSEC_LOGS=()
-declare -A SEEN_MODSEC=()
-
-trim_directive_value(){
-  local value="$1"
-  value="${value%%#*}"
-  value="${value%;}"
-  value="${value%\"}"; value="${value#\"}"
-  value="${value%\'}"; value="${value#\'}"
-  printf '%s' "$value"
-}
-
-add_log_path(){
-  local target="$1" value="$2"
-  [[ -n "$value" ]] || return 0
-  [[ "$value" == off || "$value" == syslog:* || "$value" == pipe:* ]] && return 0
-  [[ "$value" == /* ]] || return 0
-  [[ "$value" == *'$'* || "$value" == *' '* ]] && return 0
-  if [[ "$target" == nginx ]]; then
-    NGINX_LOGS["$value"]=1
-  else
-    MODSEC_LOGS["$value"]=1
-  fi
-}
-
-discover_modsecurity_file(){
-  local initial="$1"
-  local -a queue=()
-  local current line directive value base expanded
-  queue+=("$initial")
-
-  while ((${#queue[@]})); do
-    current="${queue[0]}"
-    queue=("${queue[@]:1}")
-    [[ -r "$current" && -f "$current" ]] || continue
-    [[ -n "${SEEN_MODSEC[$current]:-}" ]] && continue
-    SEEN_MODSEC["$current"]=1
-    base="$(dirname -- "$current")"
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      read -r directive value _ <<< "$line"
-      [[ -n "${directive:-}" && -n "${value:-}" ]] || continue
-      value="$(trim_directive_value "$value")"
-
-      case "$directive" in
-        SecAuditLog|SecDebugLog)
-          add_log_path modsec "$value"
-          ;;
-        Include)
-          if [[ "$value" != /* ]]; then
-            value="${base}/${value}"
-          fi
-          if [[ "$value" == *'*'* || "$value" == *'?'* || "$value" == *'['* ]]; then
-            while IFS= read -r expanded; do
-              [[ -n "$expanded" && -f "$expanded" ]] && queue+=("$expanded")
-            done < <(compgen -G "$value" || true)
-          elif [[ -f "$value" ]]; then
-            queue+=("$value")
-          fi
-          ;;
-      esac
-    done < "$current"
-  done
-}
-
-discover_brebes_waf(){
-  local dump_file line directive value modsec_file
-  local nginx_ok=0
-  command -v nginx >/dev/null 2>&1 || die "Brebes-WAF profile selected, but nginx command was not found."
-  dump_file="$(mktemp)"
-  if ! nginx -T >"$dump_file" 2>&1; then
-    cat "$dump_file" >&2
-    rm -f "$dump_file"
-    die "nginx -T failed. Fix/check Nginx configuration before installing the WAF profile."
-  fi
-  nginx_ok=1
-
-  # nginx -T output includes the active configuration and all expanded includes.
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    read -r directive value _ <<< "$line"
-    [[ -n "${directive:-}" && -n "${value:-}" ]] || continue
-    case "$directive" in
-      access_log|error_log)
-        value="$(trim_directive_value "$value")"
-        add_log_path nginx "$value"
-        ;;
-      modsecurity_rules_file)
-        modsec_file="$(trim_directive_value "$value")"
-        [[ "$modsec_file" == /* && -r "$modsec_file" ]] &&
-          discover_modsecurity_file "$modsec_file"
-        ;;
-    esac
-  done < "$dump_file"
-  rm -f "$dump_file"
-
-  (( nginx_ok == 1 )) || die "Nginx configuration discovery failed."
-  ((${#NGINX_LOGS[@]} > 0)) ||
-    warn "No static Nginx access_log/error_log paths found in nginx -T output."
-  ((${#MODSEC_LOGS[@]} > 0)) ||
-    warn "No SecAuditLog/SecDebugLog paths found in referenced ModSecurity files."
-}
-
-# Discover before package installation, so a failed WAF inspection does not
-# leave a partially installed Agent behind.
-if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
-  log "Reading active Nginx configuration and included ModSecurity files on this endpoint..."
-  discover_brebes_waf
-  log "Discovery result: ${#NGINX_LOGS[@]} Nginx log path(s), ${#MODSEC_LOGS[@]} ModSecurity log path(s)."
-else
-  log "Docker-PHP base profile selected."
-  log "No global Docker container logs will be collected."
-  log "Per-application monitoring will be registered later by create-php-app.sh."
 fi
 
 REG_PASSWORD=""
@@ -492,8 +592,9 @@ CONFIG_CHANGED=0
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   {
-    for path in "${!NGINX_LOGS[@]}"; do printf '%s\n' "$path"; done
-    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\n' "$path"; done
+    for path in "${!NGINX_ACCESS_LOGS[@]}"; do printf '%s\\tjson\\n' "$path"; done
+    for path in "${!NGINX_ERROR_LOGS[@]}"; do printf '%s\\tsyslog\\n' "$path"; done
+    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\\tsyslog\\n' "$path"; done
   } | sort -u > "$PATHS_FILE"
 fi
 
@@ -522,7 +623,7 @@ cleanup_files(){
     fi
   fi
 
-  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}"
+  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}" "${NGINX_DUMP:-}" "${DISCOVERY_REPORT:-}"
   cleanup
   exit "$exit_code"
 }
@@ -559,28 +660,42 @@ if not blocks:
     raise SystemExit("No <ossec_config> block found; refusing to modify the active file.")
 
 if profile == "brebes-waf":
-    paths = []
+    paths = {}
     for raw in Path(paths_file).read_text(encoding="utf-8").splitlines():
-        path = raw.strip()
-        if path and path not in paths:
-            paths.append(path)
+        parts = raw.split("\\t", 1)
+        if len(parts) != 2:
+            raise SystemExit(f"Invalid discovered log entry: {raw!r}")
+        path, fmt = parts[0].strip(), parts[1].strip()
+        if path:
+            if path in paths and paths[path] != fmt:
+                raise SystemExit(f"Conflicting log formats discovered for {path}")
+            paths[path] = fmt
 
-    existing_locations = set()
+    existing_locations = {}
     for node in parsed.iter("localfile"):
         location = node.find("location")
+        log_format = node.find("log_format")
         if location is not None and location.text:
-            existing_locations.add(location.text.strip())
+            existing_locations[location.text.strip()] = (
+                (log_format.text or "default").strip() if log_format is not None else "default"
+            )
 
     additions = []
-    for path in paths:
+    for path, fmt in paths.items():
         if path in existing_locations:
+            current_fmt = existing_locations[path]
+            if current_fmt != fmt:
+                raise SystemExit(
+                    f"Existing localfile for {path} uses log_format={current_fmt}; "
+                    f"discovery requires {fmt}. Refusing to overwrite existing settings."
+                )
             continue
         escaped = html.escape(path, quote=False)
         additions.append(
-            "  <localfile>\n"
-            f"    <location>{escaped}</location>\n"
-            "    <log_format>syslog</log_format>\n"
-            "  </localfile>\n"
+            "  <localfile>\\n"
+            f"    <location>{escaped}</location>\\n"
+            f"    <log_format>{fmt}</log_format>\\n"
+            "  </localfile>\\n"
         )
 
     # Insert only missing localfile entries into the first ossec_config block.
@@ -831,9 +946,12 @@ Endpoint installation / profile update:
 
 Brebes-WAF:
   Discovery runs on the Brebes-WAF endpoint using nginx -T, which expands active
-  Nginx include files. Referenced ModSecurity rule files and their Include
-  directives are read recursively. Concrete absolute access_log/error_log,
-  SecAuditLog and SecDebugLog paths are collected.
+  Nginx include files. Every server block must have an explicit access_log whose
+  referenced log_format is verified as a JSON object using escape=json.
+  Missing/default, disabled, dynamic, or non-JSON access logs abort installation
+  before package installation, enrollment, or Agent configuration changes.
+  Nginx error logs and discovered ModSecurity log paths are collected as syslog.
+  Nginx and ModSecurity configurations are never modified.
   The installer backs up /var/ossec/etc/ossec.conf, stages the updated file,
   validates it with wazuh-agentd -t, and restores the backup if validation fails.
   Nginx and ModSecurity configuration files are never modified.
