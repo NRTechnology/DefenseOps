@@ -24,6 +24,8 @@ readonly MIN_STORAGE_GIB=250
 readonly RAW_LOG_RETENTION_DAYS=30
 readonly ALERT_RETENTION_DAYS=90
 readonly MANAGER_ARCHIVE_RETENTION_DAYS=14
+readonly WAZUH_ARCHIVE_INDEX_PATTERN="wazuh-archives-4.x-*"
+readonly BREBES_WAF_ACCESS_LOG="/var/log/nginx/brebes-waf/access.json"
 readonly WAZUH_VERSION="${WAZUH_VERSION:-4.14.10}"
 readonly WAZUH_REPO_URL="https://github.com/wazuh/wazuh-docker.git"
 readonly WAZUH_REPO_BRANCH="v${WAZUH_VERSION}"
@@ -591,36 +593,191 @@ configure_indexer_retention_policies() {
 }
 
 configure_filebeat_archives() {
-    log "Mengaktifkan forwarding raw archives pada Filebeat di Manager..."
-    local container_id=""
+    log "Memastikan Filebeat meneruskan Wazuh JSON archives ke Indexer..."
+    local container_id="" changed=""
     container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
-    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk konfigurasi Filebeat."
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan."
 
-    docker exec "$container_id" python3 - <<'PYFILEBEAT'
-import re
+    changed="$(docker exec "$container_id" python3 - <<'PYFILEBEAT'
+import os, re, shutil, tempfile
+from datetime import datetime
 from pathlib import Path
 p = Path("/etc/filebeat/filebeat.yml")
-if not p.is_file():
-    raise SystemExit(f"Filebeat config tidak ditemukan: {p}")
+if not p.is_file(): raise SystemExit(f"Filebeat config tidak ditemukan: {p}")
 s = p.read_text(encoding="utf-8")
-# Scope the edit to the Wazuh module's archives subsection; keep the rest of
-# the upstream Filebeat configuration and comments intact.
-module = re.search(r"(?ms)^\s*-\s*module:\s*wazuh\s*$.*?(?=^\s*-\s*module:|\Z)", s)
-if not module:
-    raise SystemExit("Wazuh Filebeat module tidak ditemukan; konfigurasi tidak diubah")
-block = module.group(0)
-archives = re.search(r"(?ms)(^\s*archives:\s*\n)(\s+enabled:\s*)(true|false)", block)
-if not archives:
-    raise SystemExit("archives.enabled tidak ditemukan pada Wazuh Filebeat module")
-block = block[:archives.start(3)] + "true" + block[archives.end(3):]
-s = s[:module.start()] + block + s[module.end():]
-p.write_text(s, encoding="utf-8")
+m = re.search(r"(?ms)^[ \t]*-[ \t]*module:[ \t]*wazuh[ \t]*\n.*?(?=^[ \t]*-[ \t]*module:|\Z)", s)
+if not m: raise SystemExit("Wazuh Filebeat module tidak ditemukan.")
+b = m.group(0)
+a = re.search(r"(?m)^([ \t]*archives:[ \t]*\n)([ \t]+enabled:[ \t]*)(true|false)([ \t]*)$", b)
+if not a: raise SystemExit("archives.enabled tidak ditemukan pada Wazuh Filebeat module.")
+if a.group(3) == "true":
+    print("UNCHANGED")
+    raise SystemExit(0)
+ub = b[:a.start(3)] + "true" + b[a.end(3):]
+updated = s[:m.start()] + ub + s[m.end():]
+stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+backup = p.with_name(p.name + ".defenseops-backup-" + stamp)
+shutil.copy2(p, backup)
+fd, tmp = tempfile.mkstemp(prefix=".filebeat.yml.", dir=str(p.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(updated); f.flush(); os.fsync(f.fileno())
+    shutil.copystat(p, tmp)
+    os.replace(tmp, p)
+except Exception:
+    try: Path(tmp).unlink()
+    except FileNotFoundError: pass
+    raise
+print("CHANGED")
+print(f"Backup: {backup}")
 PYFILEBEAT
+)" || die "Gagal mengatur Filebeat archives."
 
     docker exec "$container_id" filebeat test config -c /etc/filebeat/filebeat.yml -e >/dev/null \
-        || die "Validasi konfigurasi Filebeat gagal setelah mengaktifkan archives."
-    docker restart "$container_id" >/dev/null
-    ok "Filebeat archives aktif dan Manager direstart untuk menerapkan konfigurasi."
+        || die "Validasi konfigurasi Filebeat gagal."
+    if [[ "$changed" == CHANGED* ]]; then
+        docker restart "$container_id" >/dev/null
+    fi
+    docker exec "$container_id" filebeat test output -c /etc/filebeat/filebeat.yml -e >/dev/null \
+        || die "Filebeat tidak dapat terhubung ke Wazuh Indexer."
+    ok "Filebeat archives.enabled=true; konfigurasi valid dan output Indexer berhasil diuji."
+}
+
+configure_effective_manager_archives() {
+    log "Memastikan konfigurasi Archives pada ossec.conf aktif di volume Manager..."
+    local container_id="" result=""
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan."
+
+    result="$(docker exec "$container_id" python3 - <<'PYMANAGER'
+import os, re, shutil, tempfile
+from datetime import datetime
+from pathlib import Path
+import xml.etree.ElementTree as ET
+p = Path("/var/ossec/etc/ossec.conf")
+if not p.is_file() or not p.stat().st_size: raise SystemExit("ossec.conf aktif tidak ditemukan/kosong.")
+if p.is_symlink(): raise SystemExit("ossec.conf berupa symlink; menolak perubahan.")
+original = p.read_text(encoding="utf-8")
+gm = re.search(r"(?s)<global\b[^>]*>.*?</global\s*>", original)
+if not gm: raise SystemExit("Blok global tidak ditemukan.")
+block = gm.group(0)
+for key, value in (("logall", "no"), ("logall_json", "yes")):
+    rx = re.compile(rf"(?m)^([ \t]*<{key}>)[^<]*(</{key}>[ \t]*)$")
+    matches = list(rx.finditer(block))
+    if len(matches) > 1: raise SystemExit(f"Duplikasi <{key}> ditemukan.")
+    if matches:
+        block = rx.sub(lambda x: x.group(1) + value + x.group(2), block, count=1)
+    else:
+        block = block.replace("</global>", f"    <{key}>{value}</{key}>\n  </global>", 1)
+updated = original[:gm.start()] + block + original[gm.end():]
+try:
+    ET.fromstring("<root>" + re.sub(r"^\s*<\?xml[^?]*\?>", "", updated, count=1) + "</root>")
+except ET.ParseError as exc: raise SystemExit(f"XML hasil perubahan tidak valid: {exc}")
+if updated == original:
+    print("UNCHANGED")
+    raise SystemExit(0)
+stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+backup = p.with_name(p.name + ".defenseops-backup-" + stamp)
+shutil.copy2(p, backup)
+fd, tmp = tempfile.mkstemp(prefix=".ossec.conf.", dir=str(p.parent))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(updated); f.flush(); os.fsync(f.fileno())
+    shutil.copystat(p, tmp)
+    os.replace(tmp, p)
+except Exception:
+    try: Path(tmp).unlink()
+    except FileNotFoundError: pass
+    raise
+print("CHANGED")
+print(f"Backup: {backup}")
+PYMANAGER
+)" || die "Gagal memperbarui ossec.conf aktif."
+
+    if ! docker exec "$container_id" /var/ossec/bin/wazuh-analysisd -t >/dev/null 2>&1; then
+        local backup_in_container=""
+        backup_in_container="$(docker exec "$container_id" sh -c 'ls -1t /var/ossec/etc/ossec.conf.defenseops-backup-* 2>/dev/null | head -n 1' || true)"
+        if [[ -n "$backup_in_container" ]]; then
+            docker exec "$container_id" cp -a "$backup_in_container" /var/ossec/etc/ossec.conf
+        fi
+        die "Validasi konfigurasi Wazuh gagal; konfigurasi sebelumnya dipulihkan jika backup tersedia."
+    fi
+
+    if [[ "$result" == CHANGED* ]]; then
+        log "Konfigurasi aktif berubah dan tervalidasi; restart Manager diperlukan."
+        docker restart "$container_id" >/dev/null
+        wait_for_manager
+    else
+        log "Konfigurasi aktif sudah sesuai; restart Manager tidak diperlukan."
+    fi
+
+    docker exec "$container_id" python3 - <<'PYVERIFY'
+import re
+from pathlib import Path
+s = Path("/var/ossec/etc/ossec.conf").read_text(encoding="utf-8")
+m = re.search(r"(?s)<global\b[^>]*>(.*?)</global\s*>", s)
+if not m: raise SystemExit("Blok global tidak ditemukan.")
+for key, expected in (("logall", "no"), ("logall_json", "yes")):
+    vals = re.findall(rf"<{key}>\s*(.*?)\s*</{key}>", m.group(1))
+    if vals != [expected]: raise SystemExit(f"{key}: expected exactly {expected}, found {vals}")
+PYVERIFY
+    ok "Manager aktif: logall=no dan logall_json=yes."
+}
+
+create_brebes_waf_archive_guide() {
+    local guide_dir="${DEFENSEOPS_ROOT}/docs"
+    local agent_dir="${DEFENSEOPS_ROOT}/agent-config/brebes-waf"
+    install -d -m 0750 "$guide_dir" "$agent_dir"
+    cat > "${agent_dir}/localfile-access-json.xml" <<'AGENTXML'
+<!-- Brebes-WAF Agent localfile input -->
+<localfile>
+  <location>/var/log/nginx/brebes-waf/access.json</location>
+  <log_format>json</log_format>
+</localfile>
+AGENTXML
+    chmod 0640 "${agent_dir}/localfile-access-json.xml"
+    cat > "${guide_dir}/brebes-waf-json-archives.md" <<'GUIDE'
+# DefenseOps - Brebes-WAF JSON Archives
+
+## Agent input
+The Brebes-WAF Agent must monitor `/var/log/nginx/brebes-waf/access.json`
+using `<log_format>json</log_format>`. The Manager cannot read a remote
+endpoint file directly. The XML snippet is in
+`agent-config/brebes-waf/localfile-access-json.xml`.
+
+## Manager archive pipeline
+- Manager `logall=no`
+- Manager `logall_json=yes`
+- Filebeat Wazuh module `archives.enabled=true`
+- Index pattern: `wazuh-archives-*`
+- Dashboard time field: `timestamp` (not `@timestamp`)
+- Index retention: 30 days
+- Local compressed Manager archive cleanup: 14 days
+
+## Dashboard
+If missing, create index pattern `wazuh-archives-*` in Dashboard Management
+and select `timestamp` as its time field. Open Discover and select that
+pattern. Use the time picker to select the incident window.
+
+Example DQL (verify exact field paths in Discover):
+`data.host:"losari.brebeskab.go.id" AND data.method:"POST"`
+
+Wazuh's JSON decoder commonly places decoded fields under `data`; actual
+mapping must be checked in Discover before relying on a saved query.
+
+## Validation
+1. Confirm the endpoint Agent is Active.
+2. Confirm Agent localfile monitors the exact access.json path with json.
+3. Generate a harmless HTTP request.
+4. Confirm it appears in Manager `/var/ossec/logs/archives/archives.json`.
+5. Confirm it appears in `wazuh-archives-*`.
+6. Confirm a normal request appears even if it does not generate an alert.
+
+Archives contain events from all enrolled Agents, not only Brebes-WAF.
+Monitor ingestion volume, Indexer storage, and retention.
+GUIDE
+    chmod 0640 "${guide_dir}/brebes-waf-json-archives.md"
+    ok "Panduan Archives dan snippet Agent Brebes-WAF dibuat."
 }
 
 install_manager_archive_retention() {
@@ -1476,12 +1633,14 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Manager..."
     compose_up manager
     ensure_manager_agent_enrollment
+    configure_effective_manager_archives
     wait_for_manager
     configure_manager_api_tls
     rotate_wazuh_api_admin_password
     configure_filebeat_archives
     wait_for_manager
     install_manager_archive_retention
+    create_brebes_waf_archive_guide
 
     log "Menjalankan Wazuh Dashboard..."
     compose_up dashboard
@@ -1628,7 +1787,10 @@ print_installation_summary() {
     printf 'Enrollment Listener   : %s\n' "$(ss -lnt 2>/dev/null | awk '$4 ~ /:1515$/ {found=1} END {print found ? "1515/TCP LISTENING" : "NOT LISTENING"}')"
 
     printf '\n%b[ LOG COLLECTION & RETENTION ]%b\n' "$BLUE" "$NC"
-    printf 'Raw JSON Events       : enabled\n'
+    printf 'Raw JSON Events       : enabled (Manager logall_json=yes)\n'
+    printf 'Archives Index        : %s\n' "$WAZUH_ARCHIVE_INDEX_PATTERN"
+    printf 'Dashboard Time Field  : timestamp\n'
+    printf 'Brebes-WAF JSON Input : %s (Agent localfile json)\n' "$BREBES_WAF_ACCESS_LOG"
     printf 'Raw Logs Indexer      : %s days\n' "$RAW_LOG_RETENTION_DAYS"
     printf 'Security Alerts       : %s days\n' "$ALERT_RETENTION_DAYS"
     printf 'Manager Local Archives: %s days (compressed files)\n' "$MANAGER_ARCHIVE_RETENTION_DAYS"
@@ -1694,7 +1856,8 @@ main() {
         log "Rencana: hostname defenseops -> repository Ubuntu -> dependencies -> Docker/Compose -> sysctl ->"
         log "direktori/network -> source Wazuh ${WAZUH_VERSION} -> TLS/passwords ->"
         log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> Manager API TLS -> health checks."
-        log "Raw JSON events -> Indexer ISM retention (raw 30d, alerts 90d) ->"
+        log "Raw JSON events (logall_json=yes) + Filebeat archives.enabled=true -> ${WAZUH_ARCHIVE_INDEX_PATTERN} ->"
+        log "Brebes-WAF Agent JSON localfile: ${BREBES_WAF_ACCESS_LOG}; archive retention 30d, alerts 90d ->"
         log "Manager local compressed archives cleanup (14d)."
         log "NTP/chrony -> optional timezone Asia/Jakarta -> enrollment password use_password=yes in persistent wazuh_etc volume."
         log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
