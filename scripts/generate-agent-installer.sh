@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.4.0"
+INSTALLER_VERSION="1.4.1"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -756,9 +756,9 @@ CONFIG_CHANGED=0
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   {
-    for path in "${!NGINX_ACCESS_LOGS[@]}"; do printf '%s\\tjson\\n' "$path"; done
-    for path in "${!NGINX_ERROR_LOGS[@]}"; do printf '%s\\tsyslog\\n' "$path"; done
-    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\\tsyslog\\n' "$path"; done
+    for path in "${!NGINX_ACCESS_LOGS[@]}"; do printf '%s\tjson\n' "$path"; done
+    for path in "${!NGINX_ERROR_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
+    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
   } | sort -u > "$PATHS_FILE"
 fi
 
@@ -856,10 +856,10 @@ if profile == "brebes-waf":
             continue
         escaped = html.escape(path, quote=False)
         additions.append(
-            "  <localfile>\\n"
-            f"    <location>{escaped}</location>\\n"
-            f"    <log_format>{fmt}</log_format>\\n"
-            "  </localfile>\\n"
+            "  <localfile>\n"
+            f"    <location>{escaped}</location>\n"
+            f"    <log_format>{fmt}</log_format>\n"
+            "  </localfile>\n"
         )
 
     # Insert only missing localfile entries into the first ossec_config block.
