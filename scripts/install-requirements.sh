@@ -42,6 +42,7 @@ readonly CREDENTIALS_FILE="${DEFENSEOPS_ROOT}/secrets/wazuh-credentials.env"
 
 LOG_FILE="${LOG_FILE:-/var/log/defenseops-install-requirements.log}"
 DRY_RUN=0
+REPAIR_ARCHIVES_ONLY=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log()  { printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$*"; }
@@ -56,6 +57,7 @@ Usage: sudo ./$SCRIPT_NAME [options]
 
 Options:
   --dry-run       Check requirements and show the installation plan only.
+  --repair-archives-only  Repair persistent Filebeat archives config only; do not redeploy Wazuh.
   -h, --help      Show this help.
 
 Environment:
@@ -65,6 +67,7 @@ Environment:
 
 Example:
   sudo ./$SCRIPT_NAME --dry-run
+  sudo ./$SCRIPT_NAME --repair-archives-only
   sudo ./$SCRIPT_NAME
 USAGE
 }
@@ -72,6 +75,7 @@ USAGE
 while (($#)); do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        --repair-archives-only) REPAIR_ARCHIVES_ONLY=1 ;;
         -h|--help) usage; exit 0 ;;
         *) die "Opsi tidak dikenal: $1 (gunakan --help)." ;;
     esac
@@ -592,54 +596,101 @@ configure_indexer_retention_policies() {
 }
 
 configure_filebeat_archives() {
-    log "Memastikan Filebeat meneruskan Wazuh JSON archives ke Indexer..."
-    local container_id="" changed=""
+    log "Memastikan Filebeat archives aktif pada volume persisten host..."
+    local container_id mount_info volume_name volume_mount config_file changed
     container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
     [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan."
 
-    changed="$(docker exec "$container_id" python3 - <<'PYFILEBEAT'
+    # Resolve the actual host-side mount backing /etc/filebeat. Do not rely on
+    # edits made only in the container writable layer.
+    mount_info="$(docker inspect "$container_id" --format '{{range .Mounts}}{{if eq .Destination "/etc/filebeat"}}{{.Name}}|{{.Source}}{{end}}{{end}}')"
+    [[ -n "$mount_info" && "$mount_info" == *'|'* ]] || die "Mount /etc/filebeat tidak ditemukan pada container Manager."
+    volume_name="${mount_info%%|*}"
+    if [[ -n "$volume_name" ]]; then
+        volume_mount="$(docker volume inspect -f '{{.Mountpoint}}' "$volume_name")" \
+            || die "Gagal mendapatkan mountpoint Docker volume ${volume_name}."
+    else
+        volume_mount="${mount_info#*|}"
+    fi
+    [[ -d "$volume_mount" ]] || die "Direktori volume Filebeat tidak ditemukan: ${volume_mount}"
+    config_file="${volume_mount}/filebeat.yml"
+    [[ -s "$config_file" && -f "$config_file" && ! -L "$config_file" ]] \
+        || die "filebeat.yml persisten tidak ditemukan/valid: ${config_file}"
+
+    log "Filebeat volume : ${volume_name:-bind-mount}"
+    log "Host config     : ${config_file}"
+
+    changed="$(FILEBEAT_CONFIG="$config_file" python3 - <<'PYFILEBEAT'
 import os, re, shutil, tempfile
 from datetime import datetime
 from pathlib import Path
-p = Path("/etc/filebeat/filebeat.yml")
-if not p.is_file(): raise SystemExit(f"Filebeat config tidak ditemukan: {p}")
-s = p.read_text(encoding="utf-8")
-m = re.search(r"(?ms)^[ \t]*-[ \t]*module:[ \t]*wazuh[ \t]*\n.*?(?=^[ \t]*-[ \t]*module:|\Z)", s)
-if not m: raise SystemExit("Wazuh Filebeat module tidak ditemukan.")
-b = m.group(0)
-a = re.search(r"(?m)^([ \t]*archives:[ \t]*\n)([ \t]+enabled:[ \t]*)(true|false)([ \t]*)$", b)
-if not a: raise SystemExit("archives.enabled tidak ditemukan pada Wazuh Filebeat module.")
-if a.group(3) == "true":
+
+p = Path(os.environ["FILEBEAT_CONFIG"])
+original = p.read_text(encoding="utf-8")
+module = re.search(
+    r"(?ms)^[ \t]*-[ \t]*module:[ \t]*wazuh[ \t]*\n.*?(?=^[ \t]*-[ \t]*module:|\Z)",
+    original,
+)
+if not module:
+    raise SystemExit("Wazuh Filebeat module tidak ditemukan; file tidak diubah.")
+block = module.group(0)
+archives = re.search(
+    r"(?m)^([ \t]*archives:[ \t]*\n)([ \t]+enabled:[ \t]*)(true|false)([ \t]*)$",
+    block,
+)
+if not archives:
+    raise SystemExit("archives.enabled tidak ditemukan pada modul Wazuh; file tidak diubah.")
+if archives.group(3) == "true":
     print("UNCHANGED")
     raise SystemExit(0)
-ub = b[:a.start(3)] + "true" + b[a.end(3):]
-updated = s[:m.start()] + ub + s[m.end():]
+
+updated_block = block[:archives.start(3)] + "true" + block[archives.end(3):]
+updated = original[:module.start()] + updated_block + original[module.end():]
 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 backup = p.with_name(p.name + ".defenseops-backup-" + stamp)
 shutil.copy2(p, backup)
 fd, tmp = tempfile.mkstemp(prefix=".filebeat.yml.", dir=str(p.parent))
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(updated); f.flush(); os.fsync(f.fileno())
+        f.write(updated)
+        f.flush()
+        os.fsync(f.fileno())
     shutil.copystat(p, tmp)
     os.replace(tmp, p)
 except Exception:
-    try: Path(tmp).unlink()
-    except FileNotFoundError: pass
+    try:
+        Path(tmp).unlink()
+    except FileNotFoundError:
+        pass
     raise
 print("CHANGED")
 print(f"Backup: {backup}")
 PYFILEBEAT
-)" || die "Gagal mengatur Filebeat archives."
+)" || die "Gagal memperbarui filebeat.yml pada volume persisten."
 
-    docker exec "$container_id" filebeat test config -c /etc/filebeat/filebeat.yml -e >/dev/null \
+    # Confirm the container sees the exact host-volume change and validate it.
+    docker exec "$container_id" sh -c \
+        'awk "/^[[:space:]]*archives:/ {in_archives=1; next} in_archives && /^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$/ {ok=1; exit} in_archives && /^[^[:space:]]/ {exit} END {exit !ok}" /etc/filebeat/filebeat.yml' \
+        || die "Container tidak membaca archives.enabled=true dari volume persisten."
+    docker exec "$container_id" filebeat test config -c /etc/filebeat/filebeat.yml -e \
         || die "Validasi konfigurasi Filebeat gagal."
+
     if [[ "$changed" == CHANGED* ]]; then
-        docker restart "$container_id" >/dev/null
+        # Restart only the supervised Filebeat service; keep Manager, agents,
+        # Indexer and Dashboard processes untouched.
+        docker exec "$container_id" sh -c '
+            command -v s6-svc >/dev/null 2>&1 || exit 20
+            test -d /run/service/filebeat || exit 21
+            s6-svc -r /run/service/filebeat
+        ' || die "Konfigurasi sudah tersimpan, tetapi Filebeat saja tidak dapat direstart melalui s6. Tidak ada restart container yang dilakukan. Periksa service supervisor secara manual."
+        log "Filebeat service direstart tanpa me-restart container Manager."
+    else
+        log "archives.enabled sudah true; tidak ada perubahan atau restart dilakukan."
     fi
-    docker exec "$container_id" filebeat test output -c /etc/filebeat/filebeat.yml -e >/dev/null \
+
+    docker exec "$container_id" filebeat test output -c /etc/filebeat/filebeat.yml -e \
         || die "Filebeat tidak dapat terhubung ke Wazuh Indexer."
-    ok "Filebeat archives.enabled=true; konfigurasi valid dan output Indexer berhasil diuji."
+    ok "Filebeat archives.enabled=true tersimpan pada volume host dan tervalidasi."
 }
 
 configure_effective_manager_archives() {
@@ -1789,6 +1840,15 @@ print_installation_summary() {
 }
 
 main() {
+    if (( REPAIR_ARCHIVES_ONLY )); then
+        log "===== DefenseOps Filebeat Archives Repair Only ====="
+        command -v docker >/dev/null 2>&1 || die "Docker tidak ditemukan."
+        docker info >/dev/null 2>&1 || die "Docker daemon tidak dapat diakses."
+        configure_filebeat_archives
+        log "Perbaikan archives selesai. Komponen selain Filebeat tidak disentuh."
+        exit 0
+    fi
+
     log "===== DefenseOps Full Requirements & Wazuh Installer ====="
     check_system_requirements
 
