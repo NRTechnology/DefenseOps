@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.3.6"
+INSTALLER_VERSION="1.3.7"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -214,7 +214,7 @@ fi
 ACTIVE_AGENT_CONF="/var/ossec/etc/ossec.conf"
 ACTIVE_MANAGER=""
 if (( AGENT_ALREADY_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
-  ACTIVE_MANAGER="$(sed -n 's:.*<address>\\([^<]*\\)</address>.*:\\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
+  ACTIVE_MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
 fi
 
 if (( AGENT_ALREADY_INSTALLED == 1 )); then
@@ -225,7 +225,7 @@ if (( AGENT_ALREADY_INSTALLED == 1 )); then
 fi
 
 if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
-  MANAGER="$(sed -n 's:.*<address>\\([^<]*\\)</address>.*:\\1:p' "$CONFIG_FILE" | head -n1)"
+  MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
 fi
 [[ -n "$MANAGER" ]] || die "Manager address unavailable. Use --manager or provide ossec.conf."
 [[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address."
@@ -317,108 +317,225 @@ discover_brebes_waf(){
     die "nginx -T failed. Fix/check Nginx configuration before installing the WAF profile."
   fi
 
-  if ! python3 - "$dump_file" "$report_file" <<'PYNGINX'
-import re, sys
+  if ! python3 - "$report_file" <<'PYNGINX'
+import glob
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
-source, report = sys.argv[1:3]
-text = Path(source).read_text(encoding="utf-8", errors="replace")
-token_re = re.compile(r"""(?xs)\s+|\#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[;{}]|[^\s;{}#]+""")
-tokens = []
-for m in token_re.finditer(text):
-    t = m.group(0)
-    if not t or t.isspace() or t.startswith("#"): continue
-    if t[0:1] in ("'", '"') and t[-1:] == t[0]: t = t[1:-1]
-    tokens.append(t)
+
+report = sys.argv[1]
+
+def fail(message, code=2):
+    print(f"[ERROR] {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+# Discover the exact main configuration path from the running Nginx build.
+try:
+    version_output = subprocess.run(
+        ["nginx", "-V"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, check=True
+    ).stdout
+except Exception as exc:
+    fail(f"Cannot determine Nginx build configuration: {exc}")
+
+conf_match = re.search(r"(?:^|\s)--conf-path=([^\s]+)", version_output)
+prefix_match = re.search(r"(?:^|\s)--prefix=([^\s]+)", version_output)
+conf_path = Path(conf_match.group(1) if conf_match else "/etc/nginx/nginx.conf")
+prefix_path = Path(prefix_match.group(1) if prefix_match else "/usr/share/nginx")
+conf_dir = conf_path.parent
 
 class Node:
-    def __init__(self, name, args=None, parent=None):
-        self.name, self.args, self.parent = name, args or [], parent
-        self.directives, self.children = [], []
+    def __init__(self, name, args=None, parent=None, source=None):
+        self.name = name
+        self.args = args or []
+        self.parent = parent
+        self.source = source
+        self.directives = []
+        self.children = []
 
-def parse_context(i=0, parent=None):
-    node = parent or Node("root")
-    while i < len(tokens):
-        words = []
-        while i < len(tokens) and tokens[i] not in (";", "{", "}"):
-            words.append(tokens[i]); i += 1
-        if i >= len(tokens):
-            if words: raise ValueError("directive without ';' at end")
+def tokenize(data, filename):
+    # Quoted arguments remain one token. Braces, semicolons and # inside
+    # quoted strings are data, never Nginx structural tokens.
+    pattern = re.compile(
+        r"""(?xs)\s+| \#[^\n]* | "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' | [;{}] | [^\s;{}#]+"""
+    )
+    result = []
+    for match in pattern.finditer(data):
+        token = match.group(0)
+        if not token or token.isspace() or token.startswith("#"):
+            continue
+        if token[0] in ("'", '"') and token[-1] == token[0]:
+            # Sentinel protects quoted braces/semicolons from parser syntax.
+            token = "\\x01" + token[1:-1]
+        result.append(token)
+    return result
+
+def include_matches(value, current_file):
+    if not os.path.isabs(value):
+        candidates = [
+            current_file.parent / value,
+            conf_dir / value,
+            prefix_path / value,
+        ]
+    else:
+        candidates = [Path(value)]
+    matches = []
+    for candidate in candidates:
+        found = sorted(glob.glob(str(candidate)))
+        if found:
+            matches.extend(Path(item) for item in found if Path(item).is_file())
             break
-        marker = tokens[i]; i += 1
+    # Preserve order while removing duplicate resolved paths.
+    unique = []
+    seen = set()
+    for item in matches:
+        resolved = str(item.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(Path(resolved))
+    return unique
+
+# Parse a file with a cursor-based recursive descent. Includes are expanded
+# into the current context at the exact position of the include directive.
+def parse_context(tokens, index, parent, current_file, stack, top_fragment=False):
+    while index < len(tokens):
+        words = []
+        while index < len(tokens) and tokens[index] not in (";", "{", "}"):
+            words.append(tokens[index])
+            index += 1
+        if index >= len(tokens):
+            if words:
+                fail(f"Directive without ';' at end of {current_file}: {' '.join(words)}")
+            return index
+        marker = tokens[index]
+        index += 1
         if marker == "}":
-            if words: raise ValueError("unexpected '}'")
-            return node, i
-        if not words: raise ValueError("empty directive/context")
-        if marker == ";": node.directives.append((words[0], words[1:]))
+            if words or top_fragment:
+                fail(f"Unexpected '}}' in {current_file}")
+            return index
+        if not words:
+            fail(f"Empty directive/context in {current_file}")
+        def decode(value):
+            return value[1:] if value.startswith("\\x01") else value
+        words = [decode(value) for value in words]
+        directive, args = words[0], words[1:]
+        if marker == ";":
+            if directive == "include":
+                if len(args) != 1:
+                    fail(f"Invalid include directive in {current_file}: {' '.join(words)}")
+                for included in include_matches(args[0], current_file):
+                    parse_file_into_context(included, parent, stack)
+            else:
+                parent.directives.append((directive, args, str(current_file)))
         else:
-            child = Node(words[0], words[1:], node)
-            child, i = parse_context(i, child)
-            node.children.append(child)
-    if parent is not None: raise ValueError("unclosed configuration context")
-    return node, i
+            child = Node(directive, args, parent, str(current_file))
+            index = parse_context(tokens, index, child, current_file, stack)
+            parent.children.append(child)
+    if top_fragment:
+        return index
+    fail(f"Unclosed context in {current_file}")
 
-def walk(n):
-    yield n
-    for c in n.children: yield from walk(c)
-def direct(n, name):
-    return [args for key, args in n.directives if key == name]
+def parse_file_into_context(path, parent, stack):
+    path = path.resolve()
+    key = str(path)
+    if key in stack:
+        fail("Nginx include cycle detected: " + " -> ".join(stack + [key]))
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        fail(f"Cannot read included Nginx configuration {path}: {exc}")
+    tokens = tokenize(data, str(path))
+    parse_context(tokens, 0, parent, path, stack + [key], top_fragment=True)
 
-try: root, _ = parse_context()
-except Exception as e:
-    print(f"[ERROR] Cannot parse expanded Nginx configuration: {e}", file=sys.stderr); sys.exit(2)
+root = Node("root")
+parse_file_into_context(conf_path, root, [])
 
-http_nodes = [n for n in walk(root) if n.name == "http"]
+def walk(node):
+    yield node
+    for child in node.children:
+        yield from walk(child)
+
+def direct(node, name):
+    return [args for key, args, _source in node.directives if key == name]
+
+http_nodes = [node for node in walk(root) if node.name == "http"]
 if not http_nodes:
-    print("[ERROR] No http {} context found.", file=sys.stderr); sys.exit(2)
+    fail(f"No http context found in {conf_path}")
+if len(http_nodes) > 1:
+    fail(f"Multiple http contexts found in {conf_path}; refusing ambiguous discovery")
+
 http = http_nodes[0]
 formats = {}
 for args in direct(http, "log_format"):
-    if len(args) < 2: continue
+    if len(args) < 2:
+        continue
     name, rest = args[0], args[1:]
-    escaped = any(x.lower() == "escape=json" for x in rest)
-    body = " ".join(x for x in rest if not x.lower().startswith("escape="))
-    formats[name] = bool(escaped and "{" in body and "}" in body and re.search(r'"[^"]+"\s*:', body))
+    escaped = any(item.lower() == "escape=json" for item in rest)
+    body = "".join(item for item in rest if not item.lower().startswith("escape="))
+    formats[name] = bool(
+        escaped and "{" in body and "}" in body
+        and re.search(r'"[^"]+"\s*:', body)
+    )
 
-http_access = direct(http, "access_log")
-servers = [n for n in walk(http) if n.name == "server"]
+servers = [node for node in walk(http) if node.name == "server"]
 if not servers:
-    print("[ERROR] No server {} virtual-host blocks found.", file=sys.stderr); sys.exit(2)
+    fail(f"No server virtual-host blocks found inside http context in {conf_path}")
 
 rows, failures = [], []
-for idx, server in enumerate(servers, 1):
-    names = [x for args in direct(server, "server_name") for x in args]
-    vhost = ",".join(names) if names else f"<server-block-{idx}-without-server_name>"
-    root_access = direct(server, "access_log")
-    nested_access = [a for child in server.children for n in walk(child) for a in direct(n, "access_log")]
-    effective = ([] if root_access else list(http_access)) + root_access + nested_access
-    if not effective:
-        failures.append((vhost, "<default Nginx access log>", "no explicit access_log; default format is not verified as JSON"))
-        continue
-    for args in effective:
+for index, server in enumerate(servers, 1):
+    names = [item for args in direct(server, "server_name") for item in args]
+    vhost = ",".join(names) if names else f"<server-block-{index}-without-server_name>"
+
+    # Deliberately inspect only access_log directives explicitly configured
+    # inside this server block or its descendants. The global http-level
+    # access_log is intentionally ignored by the Brebes-WAF policy.
+    explicit_access = []
+    for descendant in walk(server):
+        explicit_access.extend(direct(descendant, "access_log"))
+
+    for args in explicit_access:
         if not args:
-            failures.append((vhost, "<unknown>", "empty access_log directive")); continue
+            failures.append((vhost, "<unknown>", "empty access_log directive"))
+            continue
         path = args[0]
         if path == "off":
-            failures.append((vhost, "off", "access logging disabled for this context")); continue
-        if not path.startswith("/") or "$" in path or " " in path:
-            failures.append((vhost, path, "dynamic/non-file access_log path cannot be monitored safely")); continue
-        fmt = args[1] if len(args) >= 2 else "combined"
-        if fmt.startswith(("buffer=", "gzip=", "flush=", "if=")):
-            fmt = "combined"
-        if not formats.get(fmt, False):
-            failures.append((vhost, path, f"format '{fmt}' is not verified JSON (requires escape=json and JSON object)"))
-        else: rows.append((vhost, path, "json", fmt))
+            continue
+        if not path.startswith("/") or "$" in path or "\t" in path:
+            failures.append((vhost, path, "dynamic/non-file access_log path cannot be monitored safely"))
+            continue
 
+        fmt = "combined"
+        for candidate in args[1:]:
+            if candidate.startswith(("buffer=", "gzip=", "flush=", "if=")):
+                continue
+            fmt = candidate
+            break
+
+        if not formats.get(fmt, False):
+            failures.append((
+                vhost, path,
+                f"format '{fmt}' is not verified JSON (requires escape=json and a JSON object)"
+            ))
+        else:
+            rows.append((vhost, path, "json", fmt))
+
+# Preserve existing error-log discovery behavior: use explicit server/tree
+# error logs where present; otherwise inherit the http-level error_log.
 http_errors = direct(http, "error_log")
-for idx, server in enumerate(servers, 1):
-    names = [x for args in direct(server, "server_name") for x in args]
-    vhost = ",".join(names) if names else f"<server-block-{idx}-without-server_name>"
-    own_errors = [a for n in walk(server) for a in direct(n, "error_log")]
-    if not own_errors: own_errors = http_errors
+for index, server in enumerate(servers, 1):
+    names = [item for args in direct(server, "server_name") for item in args]
+    vhost = ",".join(names) if names else f"<server-block-{index}-without-server_name>"
+    own_errors = [args for node in walk(server) for args in direct(node, "error_log")]
+    if not own_errors:
+        own_errors = http_errors
     for args in own_errors:
-        if not args: continue
+        if not args:
+            continue
         path = args[0]
-        if path in ("stderr", "syslog") or path.startswith("syslog:"): continue
+        if path in ("stderr", "syslog") or path.startswith("syslog:"):
+            continue
         if path.startswith("/") and "$" not in path and " " not in path:
             rows.append((vhost, path, "syslog", "nginx-error"))
 
@@ -427,16 +544,18 @@ if failures:
     for vhost, path, reason in failures:
         print(f"  VHOST: {vhost}\n  PATH : {path}\n  WHY  : {reason}", file=sys.stderr)
     print("[ERROR] Fix every listed virtual host and rerun install-agent.sh.", file=sys.stderr)
-    sys.exit(3)
+    raise SystemExit(3)
 
 seen = set()
-with open(report, "w", encoding="utf-8") as f:
+with open(report, "w", encoding="utf-8") as output:
     for row in rows:
         if row not in seen:
-            seen.add(row); f.write("\t".join(row) + "\n")
+            seen.add(row)
+            output.write("\t".join(row) + "\n")
+
 print(f"[INFO] Nginx virtual hosts checked: {len(servers)}")
-print(f"[INFO] Verified JSON access-log entries: {sum(1 for r in rows if r[2] == 'json')}")
-print(f"[INFO] Nginx error-log entries: {sum(1 for r in rows if r[2] == 'syslog')}")
+print(f"[INFO] Verified JSON access-log entries: {sum(1 for row in rows if row[2] == 'json')}")
+print(f"[INFO] Nginx error-log entries: {sum(1 for row in rows if row[2] == 'syslog')}")
 PYNGINX
   then
     rm -f "$dump_file" "$report_file"
@@ -945,10 +1064,12 @@ Endpoint installation / profile update:
   Existing installations are not re-enrolled or upgraded by package manager.
 
 Brebes-WAF:
-  Discovery runs on the Brebes-WAF endpoint using nginx -T, which expands active
-  Nginx include files. Every server block must have an explicit access_log whose
-  referenced log_format is verified as a JSON object using escape=json.
-  Missing/default, disabled, dynamic, or non-JSON access logs abort installation
+  Discovery runs on the Brebes-WAF endpoint by recursively parsing the active
+  Nginx main configuration and its include files in their original contexts.
+  Global http-level access_log directives are intentionally ignored. Every
+  explicit access_log inside a virtual-host/server or nested context must use a
+  log_format verified as a JSON object using escape=json. Explicit access_log off
+  directives are skipped. Non-JSON or unsafe vhost access logs abort installation
   before package installation, enrollment, or Agent configuration changes.
   Nginx error logs and discovered ModSecurity log paths are collected as syslog.
   Nginx and ModSecurity configurations are never modified.
