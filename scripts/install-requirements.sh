@@ -25,7 +25,6 @@ readonly RAW_LOG_RETENTION_DAYS=30
 readonly ALERT_RETENTION_DAYS=90
 readonly MANAGER_ARCHIVE_RETENTION_DAYS=14
 readonly WAZUH_ARCHIVE_INDEX_PATTERN="wazuh-archives-4.x-*"
-readonly BREBES_WAF_ACCESS_LOG="/var/log/nginx/brebes-waf/access.json"
 readonly WAZUH_VERSION="${WAZUH_VERSION:-4.14.10}"
 readonly WAZUH_REPO_URL="https://github.com/wazuh/wazuh-docker.git"
 readonly WAZUH_REPO_BRANCH="v${WAZUH_VERSION}"
@@ -724,61 +723,6 @@ PYVERIFY
     ok "Manager aktif: logall=no dan logall_json=yes."
 }
 
-create_brebes_waf_archive_guide() {
-    local guide_dir="${DEFENSEOPS_ROOT}/docs"
-    local agent_dir="${DEFENSEOPS_ROOT}/agent-config/brebes-waf"
-    install -d -m 0750 "$guide_dir" "$agent_dir"
-    cat > "${agent_dir}/localfile-access-json.xml" <<'AGENTXML'
-<!-- Brebes-WAF Agent localfile input -->
-<localfile>
-  <location>/var/log/nginx/brebes-waf/access.json</location>
-  <log_format>json</log_format>
-</localfile>
-AGENTXML
-    chmod 0640 "${agent_dir}/localfile-access-json.xml"
-    cat > "${guide_dir}/brebes-waf-json-archives.md" <<'GUIDE'
-# DefenseOps - Brebes-WAF JSON Archives
-
-## Agent input
-The Brebes-WAF Agent must monitor `/var/log/nginx/brebes-waf/access.json`
-using `<log_format>json</log_format>`. The Manager cannot read a remote
-endpoint file directly. The XML snippet is in
-`agent-config/brebes-waf/localfile-access-json.xml`.
-
-## Manager archive pipeline
-- Manager `logall=no`
-- Manager `logall_json=yes`
-- Filebeat Wazuh module `archives.enabled=true`
-- Index pattern: `wazuh-archives-*`
-- Dashboard time field: `timestamp` (not `@timestamp`)
-- Index retention: 30 days
-- Local compressed Manager archive cleanup: 14 days
-
-## Dashboard
-If missing, create index pattern `wazuh-archives-*` in Dashboard Management
-and select `timestamp` as its time field. Open Discover and select that
-pattern. Use the time picker to select the incident window.
-
-Example DQL (verify exact field paths in Discover):
-`data.host:"losari.brebeskab.go.id" AND data.method:"POST"`
-
-Wazuh's JSON decoder commonly places decoded fields under `data`; actual
-mapping must be checked in Discover before relying on a saved query.
-
-## Validation
-1. Confirm the endpoint Agent is Active.
-2. Confirm Agent localfile monitors the exact access.json path with json.
-3. Generate a harmless HTTP request.
-4. Confirm it appears in Manager `/var/ossec/logs/archives/archives.json`.
-5. Confirm it appears in `wazuh-archives-*`.
-6. Confirm a normal request appears even if it does not generate an alert.
-
-Archives contain events from all enrolled Agents, not only Brebes-WAF.
-Monitor ingestion volume, Indexer storage, and retention.
-GUIDE
-    chmod 0640 "${guide_dir}/brebes-waf-json-archives.md"
-    ok "Panduan Archives dan snippet Agent Brebes-WAF dibuat."
-}
 
 install_manager_archive_retention() {
     local script="/usr/local/sbin/defenseops-manager-archive-retention"
@@ -1640,7 +1584,6 @@ deploy_wazuh() {
     configure_filebeat_archives
     wait_for_manager
     install_manager_archive_retention
-    create_brebes_waf_archive_guide
 
     log "Menjalankan Wazuh Dashboard..."
     compose_up dashboard
@@ -1790,7 +1733,6 @@ print_installation_summary() {
     printf 'Raw JSON Events       : enabled (Manager logall_json=yes)\n'
     printf 'Archives Index        : %s\n' "$WAZUH_ARCHIVE_INDEX_PATTERN"
     printf 'Dashboard Time Field  : timestamp\n'
-    printf 'Brebes-WAF JSON Input : %s (Agent localfile json)\n' "$BREBES_WAF_ACCESS_LOG"
     printf 'Raw Logs Indexer      : %s days\n' "$RAW_LOG_RETENTION_DAYS"
     printf 'Security Alerts       : %s days\n' "$ALERT_RETENTION_DAYS"
     printf 'Manager Local Archives: %s days (compressed files)\n' "$MANAGER_ARCHIVE_RETENTION_DAYS"
@@ -1857,7 +1799,7 @@ main() {
         log "direktori/network -> source Wazuh ${WAZUH_VERSION} -> TLS/passwords ->"
         log "3 Compose projects -> deploy Indexer, Manager, Dashboard -> Manager API TLS -> health checks."
         log "Raw JSON events (logall_json=yes) + Filebeat archives.enabled=true -> ${WAZUH_ARCHIVE_INDEX_PATTERN} ->"
-        log "Brebes-WAF Agent JSON localfile: ${BREBES_WAF_ACCESS_LOG}; archive retention 30d, alerts 90d ->"
+        log "Archive retention: raw 30d, alerts 90d -> ${WAZUH_ARCHIVE_INDEX_PATTERN};"
         log "Manager local compressed archives cleanup (14d)."
         log "NTP/chrony -> optional timezone Asia/Jakarta -> enrollment password use_password=yes in persistent wazuh_etc volume."
         log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
