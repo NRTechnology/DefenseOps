@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.3.6
+# Version     : 1.4.0
 # Release     : 2026-11-07
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.8"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.3.8"
+INSTALLER_VERSION="1.4.0"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -203,26 +203,34 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required for safe XML-aware configuration merging."
 
-AGENT_ALREADY_INSTALLED=0
+AGENT_PACKAGE_INSTALLED=0
 if command -v dpkg-query >/dev/null 2>&1 &&
    dpkg-query -W -f='${Status}' wazuh-agent 2>/dev/null | grep -q 'install ok installed'; then
-  AGENT_ALREADY_INSTALLED=1
+  AGENT_PACKAGE_INSTALLED=1
 elif command -v rpm >/dev/null 2>&1 && rpm -q wazuh-agent >/dev/null 2>&1; then
-  AGENT_ALREADY_INSTALLED=1
+  AGENT_PACKAGE_INSTALLED=1
 fi
 
 ACTIVE_AGENT_CONF="/var/ossec/etc/ossec.conf"
 ACTIVE_MANAGER=""
-if (( AGENT_ALREADY_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
+if (( AGENT_PACKAGE_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
   ACTIVE_MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
 fi
 
-if (( AGENT_ALREADY_INSTALLED == 1 )); then
+if (( AGENT_PACKAGE_INSTALLED == 1 )); then
   if [[ -n "$MANAGER" && -n "$ACTIVE_MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
-    die "Existing Agent uses Manager '${ACTIVE_MANAGER}'. Refusing to change it to '${MANAGER}' during profile update."
+    die "Installed Agent configuration uses Manager '${ACTIVE_MANAGER}'. Refusing to change it to '${MANAGER}'."
   fi
   [[ -n "$ACTIVE_MANAGER" ]] && MANAGER="$ACTIVE_MANAGER"
 fi
+
+AGENT_ENROLLED=0
+if (( AGENT_PACKAGE_INSTALLED == 1 )) &&
+   [[ -s /var/ossec/etc/client.keys ]] &&
+   awk 'NF >= 3 { found=1 } END { exit(found ? 0 : 1) }' /var/ossec/etc/client.keys; then
+  AGENT_ENROLLED=1
+fi
+AGENT_WAS_ENROLLED="$AGENT_ENROLLED"
 
 if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
   MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
@@ -245,11 +253,13 @@ esac
 log "Selected endpoint profile: ${ENDPOINT_PROFILE}"
 log "DefenseOps installer version: ${INSTALLER_VERSION}"
 
-if (( AGENT_ALREADY_INSTALLED == 1 )); then
-  log "Existing Wazuh Agent detected: update profile/configuration only."
-  log "Package installation, enrollment, Manager address, and client identity will be preserved."
+if (( AGENT_PACKAGE_INSTALLED == 1 && AGENT_ENROLLED == 1 )); then
+  log "Enrolled Wazuh Agent detected: profile/configuration update only."
+  log "Package, enrollment identity, and Manager address will be preserved."
+elif (( AGENT_PACKAGE_INSTALLED == 1 && AGENT_ENROLLED == 0 )); then
+  log "Wazuh Agent package is installed but not enrolled: enrollment will be completed without reinstalling the package."
 else
-  log "No existing Wazuh Agent detected: performing first-time installation and enrollment."
+  log "Wazuh Agent package is not installed: performing package installation and first-time enrollment."
 fi
 
 # ---------------------------------------------------------------------------
@@ -593,7 +603,7 @@ else
 fi
 
 # Time settings are opt-in. Do not overwrite chrony/timesyncd configuration.
-if (( AGENT_ALREADY_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1; then
+if (( AGENT_PACKAGE_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1; then
   CURRENT_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
   echo "Current timezone: ${CURRENT_TZ:-unknown}"
   read -r -p "Change timezone to Asia/Jakarta? [y/N] " tz_answer
@@ -617,53 +627,60 @@ if (( AGENT_ALREADY_INSTALLED == 0 )) && command -v timedatectl >/dev/null 2>&1;
       ;;
     *) log "NTP configuration unchanged." ;;
   esac
-elif (( AGENT_ALREADY_INSTALLED == 0 )); then
+elif (( AGENT_PACKAGE_INSTALLED == 0 )); then
   warn "timedatectl unavailable; timezone and NTP settings were not changed."
 fi
 
 REG_PASSWORD=""
+TEMP_AUTHD_PASS=0
 cleanup(){
+  if (( TEMP_AUTHD_PASS == 1 )); then
+    rm -f /var/ossec/etc/authd.pass
+    TEMP_AUTHD_PASS=0
+  fi
   unset REG_PASSWORD WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
 }
 trap cleanup EXIT
 
-if (( AGENT_ALREADY_INSTALLED == 0 )); then
+if (( AGENT_ENROLLED == 0 )); then
   read -r -s -p "Enrollment password for DefenseOps: " REG_PASSWORD
   printf '\n'
   [[ -n "$REG_PASSWORD" ]] || die "Enrollment password cannot be empty."
 
-  export WAZUH_MANAGER="$MANAGER"
-  export WAZUH_REGISTRATION_SERVER="$MANAGER"
-  export WAZUH_MANAGER_PORT="$MANAGER_PORT"
-  export WAZUH_REGISTRATION_PORT="$REG_PORT"
-  export WAZUH_PROTOCOL="$PROTOCOL"
-  export WAZUH_REGISTRATION_PASSWORD="$REG_PASSWORD"
-  export WAZUH_AGENT_NAME="$AGENT_NAME"
-  [[ -n "$AGENT_GROUP" ]] && export WAZUH_AGENT_GROUP="$AGENT_GROUP" || true
+  if (( AGENT_PACKAGE_INSTALLED == 0 )); then
+    # Package post-install enrollment uses the standard Wazuh environment.
+    export WAZUH_MANAGER="$MANAGER"
+    export WAZUH_REGISTRATION_SERVER="$MANAGER"
+    export WAZUH_MANAGER_PORT="$MANAGER_PORT"
+    export WAZUH_REGISTRATION_PORT="$REG_PORT"
+    export WAZUH_PROTOCOL="$PROTOCOL"
+    export WAZUH_REGISTRATION_PASSWORD="$REG_PASSWORD"
+    export WAZUH_AGENT_NAME="$AGENT_NAME"
+    [[ -n "$AGENT_GROUP" ]] && export WAZUH_AGENT_GROUP="$AGENT_GROUP" || true
 
-  [[ -r /etc/os-release ]] || die "Cannot identify Linux distribution."
-  . /etc/os-release
+    [[ -r /etc/os-release ]] || die "Cannot identify Linux distribution."
+    . /etc/os-release
 
-  case "${ID:-}" in
-    ubuntu|debian|linuxmint|pop)
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y curl gnupg apt-transport-https
-      install -d -m 0755 /usr/share/keyrings
-      curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
-        gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
-      chmod 0644 /usr/share/keyrings/wazuh.gpg
-      printf '%s\n' \
-        'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
-        > /etc/apt/sources.list.d/wazuh.list
-      apt-get update
-      apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
-      ;;
-    rhel|rocky|almalinux|centos|ol|fedora|amzn)
-      command -v rpm >/dev/null 2>&1 || die "rpm command not found."
-      rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
-      install -d -m 0755 /etc/yum.repos.d
-      cat > /etc/yum.repos.d/wazuh.repo <<'EOF'
+    case "${ID:-}" in
+      ubuntu|debian|linuxmint|pop)
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y curl gnupg apt-transport-https
+        install -d -m 0755 /usr/share/keyrings
+        curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
+          gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
+        chmod 0644 /usr/share/keyrings/wazuh.gpg
+        printf '%s\n' \
+          'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
+          > /etc/apt/sources.list.d/wazuh.list
+        apt-get update
+        apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
+        ;;
+      rhel|rocky|almalinux|centos|ol|fedora|amzn)
+        command -v rpm >/dev/null 2>&1 || die "rpm command not found."
+        rpm --import https://packages.wazuh.com/key/GPG-KEY-WAZUH
+        install -d -m 0755 /etc/yum.repos.d
+        cat > /etc/yum.repos.d/wazuh.repo <<'EOF'
 [wazuh]
 gpgcheck=1
 gpgkey=https://packages.wazuh.com/key/GPG-KEY-WAZUH
@@ -672,19 +689,47 @@ name=Wazuh repository
 baseurl=https://packages.wazuh.com/4.x/yum/
 priority=1
 EOF
-      if command -v dnf >/dev/null 2>&1; then
-        dnf install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
-      else
-        yum install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
-      fi
-      ;;
-    *)
-      die "Unsupported distribution: ${ID:-unknown}. Supported: Debian/Ubuntu and RHEL-compatible."
-      ;;
-  esac
+        if command -v dnf >/dev/null 2>&1; then
+          dnf install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
+        else
+          yum install -y "wazuh-agent-${WAZUH_AGENT_VERSION}-1"
+        fi
+        ;;
+      *)
+        die "Unsupported distribution: ${ID:-unknown}. Supported: Debian/Ubuntu and RHEL-compatible."
+        ;;
+    esac
+  else
+    # Package exists but client.keys is absent/invalid: enroll in place.
+    # Do not reinstall the package or replace an existing Agent identity.
+    log "Enrolling the already-installed Wazuh Agent without reinstalling its package."
+    [[ -x /var/ossec/bin/agent-auth ]] ||
+      die "agent-auth binary not found; cannot enroll the installed Agent."
+    # agent-auth reads the password from /var/ossec/etc/authd.pass by default.
+    # Use a temporary root-only file rather than -P, which exposes the secret
+    # in the process argument list. Refuse to overwrite a pre-existing file.
+    [[ ! -e /var/ossec/etc/authd.pass ]] ||
+      die "/var/ossec/etc/authd.pass already exists; refusing to overwrite an existing credential file."
+    ( umask 077; printf '%s' "$REG_PASSWORD" > /var/ossec/etc/authd.pass )
+    chmod 0600 /var/ossec/etc/authd.pass
+    TEMP_AUTHD_PASS=1
+    auth_args=(-m "$MANAGER" -p "$REG_PORT" -A "$AGENT_NAME")
+    [[ -n "$AGENT_GROUP" ]] && auth_args+=(-G "$AGENT_GROUP")
+    /var/ossec/bin/agent-auth "${auth_args[@]}" ||
+      die "agent-auth failed. Check Manager connectivity, enrollment password, and authd configuration."
+    rm -f /var/ossec/etc/authd.pass
+    TEMP_AUTHD_PASS=0
+  fi
+
+  unset WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
+  [[ -s /var/ossec/etc/client.keys ]] ||
+    die "Enrollment did not create /var/ossec/etc/client.keys; refusing to continue."
+  if ! awk 'NF >= 3 { found=1 } END { exit(found ? 0 : 1) }' /var/ossec/etc/client.keys; then
+    die "client.keys exists but contains no valid enrollment entry; refusing to continue."
+  fi
+  AGENT_ENROLLED=1
 else
-  log "Skipping package installation and enrollment; existing Agent identity is preserved."
-  unset REG_PASSWORD WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
+  log "Existing enrollment detected; preserving client.keys and skipping enrollment."
 fi
 
 [[ -s /var/ossec/etc/ossec.conf ]] ||
@@ -900,7 +945,7 @@ else
   if (( WAS_AGENT_ACTIVE == 1 )); then
     systemctl start wazuh-agent
     AGENT_SERVICE_STOPPED=1
-  elif (( AGENT_ALREADY_INSTALLED == 0 )); then
+  elif (( AGENT_WAS_ENROLLED == 0 )); then
     systemctl enable wazuh-agent
     systemctl start wazuh-agent
     AGENT_SERVICE_STOPPED=1
@@ -908,7 +953,7 @@ else
     log "Agent was inactive before update; preserving its inactive state."
   fi
 
-  if (( WAS_AGENT_ACTIVE == 1 || AGENT_ALREADY_INSTALLED == 0 )); then
+  if (( WAS_AGENT_ACTIVE == 1 || AGENT_WAS_ENROLLED == 0 )); then
     sleep 3
     systemctl is-active --quiet wazuh-agent ||
       die "Wazuh Agent did not become active; original configuration will be restored."
@@ -917,14 +962,19 @@ else
   log "Original configuration backup: ${BACKUP}"
 fi
 
-# Do not alter package hold/service enablement on an already-managed endpoint.
-if (( AGENT_ALREADY_INSTALLED == 0 )); then
+# Apply package hold only when this run installed the package.
+if (( AGENT_PACKAGE_INSTALLED == 0 )); then
   if command -v apt-mark >/dev/null 2>&1; then
     apt-mark hold wazuh-agent >/dev/null
   elif command -v dnf >/dev/null 2>&1; then
     dnf versionlock add wazuh-agent >/dev/null 2>&1 ||
       warn "Could not apply DNF versionlock; manage Agent updates manually."
   fi
+fi
+
+# A previously installed but unenrolled Agent has just become managed:
+# enable/start it. Preserve service state for Agents enrolled before this run.
+if (( AGENT_WAS_ENROLLED == 0 )); then
   systemctl enable wazuh-agent
   if ! systemctl is-active --quiet wazuh-agent; then
     systemctl start wazuh-agent
@@ -935,7 +985,7 @@ unset WAZUH_REGISTRATION_PASSWORD REG_PASSWORD
 if systemctl is-active --quiet wazuh-agent; then
   AGENT_SERVICE_STOPPED=0
   log "Wazuh Agent service is active."
-elif (( AGENT_ALREADY_INSTALLED == 1 )); then
+elif (( AGENT_WAS_ENROLLED == 1 )); then
   log "Wazuh Agent was inactive before profile update; its service state was preserved."
 else
   systemctl --no-pager --full status wazuh-agent || true
@@ -944,12 +994,14 @@ fi
 
 log "Installed Wazuh Agent version: $(/var/ossec/bin/wazuh-agentd -V 2>&1 | head -n1 || true)"
 log "Endpoint profile: ${ENDPOINT_PROFILE}"
-if (( AGENT_ALREADY_INSTALLED == 1 )); then
+if (( AGENT_WAS_ENROLLED == 1 )); then
   log "Manager and enrolled Agent identity: preserved (no re-enrollment)."
 else
   log "Manager: ${MANAGER}:${MANAGER_PORT}/TCP; enrollment: ${MANAGER}:${REG_PORT}/TCP"
   log "Agent name: ${AGENT_NAME}"
 fi
+log "Verify this endpoint appears as Active in the DefenseOps Dashboard."
+
 if [[ "$ENDPOINT_PROFILE" == "docker-php" ]]; then
   log "Docker-PHP application monitoring is not yet registered."
   log "It will be integrated into create-php-app.sh / delete-php-app.sh."
