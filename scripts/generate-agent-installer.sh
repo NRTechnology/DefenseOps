@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.7"
+SCRIPT_VERSION="1.3.8"
 SCRIPT_RELEASE="2026-11-08"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.3.7"
+INSTALLER_VERSION="1.3.8"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -519,7 +519,7 @@ for index, server in enumerate(servers, 1):
                 f"format '{fmt}' is not verified JSON (requires escape=json and a JSON object)"
             ))
         else:
-            rows.append((vhost, path, "json", fmt))
+            rows.append((vhost, path, fmt, "json"))
 
 # Preserve existing error-log discovery behavior: use explicit server/tree
 # error logs where present; otherwise inherit the http-level error_log.
@@ -537,7 +537,7 @@ for index, server in enumerate(servers, 1):
         if path in ("stderr", "syslog") or path.startswith("syslog:"):
             continue
         if path.startswith("/") and "$" not in path and " " not in path:
-            rows.append((vhost, path, "syslog", "nginx-error"))
+            rows.append((vhost, path, "nginx-error", "syslog"))
 
 if failures:
     print("[ERROR] Brebes-WAF JSON access-log validation failed:", file=sys.stderr)
@@ -554,8 +554,8 @@ with open(report, "w", encoding="utf-8") as output:
             output.write("\t".join(row) + "\n")
 
 print(f"[INFO] Nginx virtual hosts checked: {len(servers)}")
-print(f"[INFO] Verified JSON access-log entries: {sum(1 for row in rows if row[2] == 'json')}")
-print(f"[INFO] Nginx error-log entries: {sum(1 for row in rows if row[2] == 'syslog')}")
+print(f"[INFO] Verified JSON access-log entries: {sum(1 for row in rows if row[3] == 'json')}")
+print(f"[INFO] Nginx error-log entries: {sum(1 for row in rows if row[3] == 'syslog')}")
 PYNGINX
   then
     rm -f "$dump_file" "$report_file"
@@ -781,7 +781,7 @@ if not blocks:
 if profile == "brebes-waf":
     paths = {}
     for raw in Path(paths_file).read_text(encoding="utf-8").splitlines():
-        parts = raw.split("\\t", 1)
+        parts = raw.split("\t", 1)
         if len(parts) != 2:
             raise SystemExit(f"Invalid discovered log entry: {raw!r}")
         path, fmt = parts[0].strip(), parts[1].strip()
