@@ -1678,6 +1678,81 @@ deploy_wazuh() {
 }
 
 
+
+finalize_manager_and_verify_archives() {
+    log "Menjalankan finalisasi Manager setelah seluruh konfigurasi dan deployment selesai..."
+
+    local manager_id restart_time attempt logs groups_output group
+    manager_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$manager_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk final restart."
+
+    # Filebeat archives config is stored on the persistent /etc/filebeat volume.
+    # Restart the Manager container once, after all Manager configuration steps,
+    # so Filebeat loads the final configuration. Do not use s6-svc -r here.
+    restart_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    log "Restart final Wazuh Manager untuk memuat konfigurasi Filebeat archives..."
+    docker restart "$manager_id" >/dev/null \
+        || die "Gagal melakukan final restart Wazuh Manager."
+
+    wait_for_manager
+
+    manager_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$manager_id" ]] || die "Container Wazuh Manager tidak kembali berjalan setelah restart."
+
+    # Verify both required agent groups still exist; do not recreate or alter them.
+    groups_output="$(docker exec "$manager_id" /var/ossec/bin/agent_groups -l 2>&1)" \
+        || die "Gagal membaca agent groups setelah final restart."
+    for group in Brebes-WAF docker-php; do
+        printf '%s\n' "$groups_output" |
+            awk -v wanted="$group" '$1 == wanted && $2 ~ /^\([0-9]+\)$/ { found=1 } END { exit !found }' \
+            || die "Agent group '${group}' tidak ditemukan setelah final restart."
+        ok "Agent group '${group}' terverifikasi."
+    done
+
+    # Wait until the Filebeat process started by this restart reports archives
+    # enabled and confirms that it has opened archives.json.
+    log "Memverifikasi Filebeat archives setelah restart Manager (maksimal 5 menit)..."
+    local filebeat_ready=0
+    for attempt in $(seq 1 60); do
+        logs="$(docker logs --since "$restart_time" "$manager_id" 2>&1 || true)"
+        if printf '%s\n' "$logs" |
+            grep -E 'Enabled modules/filesets: wazuh \(archives, alerts\)|Enabled modules/filesets: wazuh \(alerts, archives\)' >/dev/null \
+            && printf '%s\n' "$logs" |
+            grep -F 'Harvester started for file: /var/ossec/logs/archives/archives.json' >/dev/null; then
+            filebeat_ready=1
+            break
+        fi
+        sleep 5
+    done
+    (( filebeat_ready == 1 )) || {
+        docker logs --since "$restart_time" "$manager_id" 2>&1 | tail -n 120 >&2 || true
+        die "Filebeat belum mengaktifkan archives atau archives.json belum dibaca setelah restart."
+    }
+    ok "Filebeat aktif dengan modul alerts dan archives; harvester archives.json berjalan."
+
+    # Verify the archive index is actually created in the Indexer. This is
+    # stronger than checking only the local Filebeat configuration.
+    log "Menunggu index ${WAZUH_ARCHIVE_INDEX_PATTERN} terbentuk (maksimal 5 menit)..."
+    local index_response index_count
+    for attempt in $(seq 1 60); do
+        index_response="$(curl -ksS --connect-timeout 5 --max-time 15 \
+            -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
+            'https://127.0.0.1:9200/_cat/indices/wazuh-archives-4.x-*?format=json' 2>/dev/null || true)"
+        index_count="$(printf '%s' "$index_response" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || printf '0')"
+        if [[ "$index_count" =~ ^[0-9]+$ ]] && (( index_count > 0 )); then
+            printf '%s\n' "$index_response" | jq -r '.[] | "  \(.health) \(.status) \(.index) docs=\(.["docs.count"])"'
+            printf '%s\n' "$index_response" | jq -e 'length > 0 and all(.[]; .health == "green" or .health == "yellow")' >/dev/null \
+                || die "Archives index ditemukan tetapi health bukan green/yellow."
+            ok "Wazuh archives aktif dan index sudah terbentuk di Indexer."
+            return
+        fi
+        sleep 5
+    done
+
+    die "Filebeat archives harvester aktif, tetapi index ${WAZUH_ARCHIVE_INDEX_PATTERN} belum terbentuk dalam 5 menit. Periksa Filebeat dan Indexer."
+}
+
+
 check_component_communications() {
     log "Memeriksa komunikasi antar-komponen Wazuh..."
     local dashboard_id manager_id indexer_id
@@ -1912,6 +1987,9 @@ main() {
     configure_kernel
     create_directories
     deploy_wazuh
+    # Final Manager restart happens only after Manager, Filebeat, and Dashboard
+    # configuration is complete. Then verify groups and end-to-end archives.
+    finalize_manager_and_verify_archives
     verify_final_state
     check_component_communications
 
