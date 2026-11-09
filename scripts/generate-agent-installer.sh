@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.4.0
-# Release     : 2026-11-07
+# Version     : 1.6.0
+# Release     : 2026-11-09
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 SCRIPT_RELEASE="2026-11-09"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.5.0"
+INSTALLER_VERSION="1.6.0"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -301,59 +301,124 @@ fi
 declare -A NGINX_ACCESS_LOGS=()
 declare -A NGINX_ERROR_LOGS=()
 declare -A MODSEC_LOGS=()
-declare -A SEEN_MODSEC=()
+declare -A MODSEC_STORAGE_DIRS=()
 NGINX_DUMP=""
 DISCOVERY_REPORT=""
+MODSEC_REPORT=""
 
-trim_directive_value(){
-  local value="$1"
-  value="${value%%#*}"; value="${value%;}"
-  value="${value%\"}"; value="${value#\"}"
-  value="${value%\'}"; value="${value#\'}"
-  printf '%s' "$value"
+# Parse ModSecurity directives with shlex so quoted paths, comments, and
+# whitespace are handled correctly. Includes are expanded recursively.
+# This is discovery only: no Nginx/ModSecurity file is edited.
+discover_modsecurity_files(){
+  local dump_file="$1"
+  local report_file="$2"
+
+  python3 - "$dump_file" "$report_file" <<'PYMODSEC'
+import glob
+import os
+import shlex
+import sys
+from pathlib import Path
+
+nginx_dump = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+
+def parse_words(line):
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    return list(lexer)
+
+def is_concrete_absolute_path(value):
+    return (
+        bool(value)
+        and os.path.isabs(value)
+        and "$" not in value
+        and "\x00" not in value
+        and "\t" not in value
+    )
+
+# nginx -T prints active configuration source lines. Only the exact Nginx
+# directive is considered; source-marker and commented lines are ignored.
+rules_files = []
+for raw in nginx_dump.read_text(encoding="utf-8", errors="replace").splitlines():
+    try:
+        words = parse_words(raw)
+    except ValueError:
+        continue
+    if len(words) >= 2 and words[0] == "modsecurity_rules_file":
+        value = words[1].removesuffix(";")
+        if is_concrete_absolute_path(value):
+            rules_files.append(Path(value))
+
+seen_files = set()
+audit_files = set()
+storage_dirs = set()
+queue = list(rules_files)
+
+while queue:
+    current = queue.pop(0)
+    try:
+        resolved = current.resolve(strict=True)
+    except OSError:
+        continue
+    if not resolved.is_file():
+        continue
+    key = str(resolved)
+    if key in seen_files:
+        continue
+    seen_files.add(key)
+
+    try:
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        continue
+
+    for raw in lines:
+        try:
+            words = parse_words(raw)
+        except ValueError:
+            continue
+        if len(words) < 2:
+            continue
+
+        directive = words[0].lower()
+        value = words[1].removesuffix(";")
+
+        if directive in ("secauditlog", "secdebuglog"):
+            if is_concrete_absolute_path(value):
+                audit_files.add(value)
+            continue
+
+        if directive == "secauditlogstoragedir":
+            if is_concrete_absolute_path(value):
+                storage_dirs.add(value)
+            continue
+
+        if directive in ("include", "includeoptional"):
+            # Preserve the existing relative-include behavior: resolve from
+            # the directory containing the file that declares the Include.
+            pattern = value if os.path.isabs(value) else str(resolved.parent / value)
+            for match in sorted(glob.glob(pattern)):
+                candidate = Path(match)
+                if candidate.is_file():
+                    queue.append(candidate)
+
+with report_path.open("w", encoding="utf-8") as out:
+    for path in sorted(audit_files):
+        out.write(f"FILE\t{path}\n")
+    for path in sorted(storage_dirs):
+        out.write(f"DIR\t{path}\n")
+PYMODSEC
 }
-add_modsec_path(){
-  local value="$1"
-  [[ -n "$value" ]] || return 0
-  [[ "$value" == /* && "$value" != *'$'* && "$value" != *' '* ]] || return 0
-  MODSEC_LOGS["$value"]=1
-}
-discover_modsecurity_file(){
-  local initial="$1"; local -a queue=()
-  local current line directive value base expanded
-  queue+=("$initial")
-  while ((${#queue[@]})); do
-    current="${queue[0]}"; queue=("${queue[@]:1}")
-    [[ -r "$current" && -f "$current" ]] || continue
-    [[ -n "${SEEN_MODSEC[$current]:-}" ]] && continue
-    SEEN_MODSEC["$current"]=1; base="$(dirname -- "$current")"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      read -r directive value _ <<< "$line"
-      [[ -n "${directive:-}" && -n "${value:-}" ]] || continue
-      value="$(trim_directive_value "$value")"
-      case "$directive" in
-        SecAuditLog|SecDebugLog) add_modsec_path "$value" ;;
-        Include)
-          [[ "$value" != /* ]] && value="${base}/${value}"
-          if [[ "$value" == *'*'* || "$value" == *'?'* || "$value" == *'['* ]]; then
-            while IFS= read -r expanded; do
-              [[ -n "$expanded" && -f "$expanded" ]] && queue+=("$expanded")
-            done < <(compgen -G "$value" || true)
-          elif [[ -f "$value" ]]; then queue+=("$value")
-          fi
-          ;;
-      esac
-    done < "$current"
-  done
-}
+
 
 discover_brebes_waf(){
   local dump_file report_file
   command -v nginx >/dev/null 2>&1 || die "Brebes-WAF profile selected, but nginx command was not found."
   command -v python3 >/dev/null 2>&1 || die "python3 is required for reliable Nginx virtual-host/log-format discovery."
-  dump_file="$(mktemp)"; report_file="$(mktemp)"
-  NGINX_DUMP="$dump_file"; DISCOVERY_REPORT="$report_file"
+  dump_file="$(mktemp)"; report_file="$(mktemp)"; modsec_report="$(mktemp)"
+  NGINX_DUMP="$dump_file"; DISCOVERY_REPORT="$report_file"; MODSEC_REPORT="$modsec_report"
   if ! nginx -T >"$dump_file" 2>&1; then
     cat "$dump_file" >&2
     die "nginx -T failed. Fix/check Nginx configuration before installing the WAF profile."
@@ -613,16 +678,25 @@ PYNGINX
     fi
   done < "$report_file"
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    read -r directive value _ <<< "$line"
-    [[ "${directive:-}" == "modsecurity_rules_file" && -n "${value:-}" ]] || continue
-    value="$(trim_directive_value "$value")"
-    [[ "$value" == /* && -r "$value" ]] && discover_modsecurity_file "$value"
-  done < "$dump_file"
+  # Discover ModSecurity audit/debug files from every active
+  # modsecurity_rules_file and its recursive Include tree.
+  discover_modsecurity_files "$dump_file" "$modsec_report"
+  while IFS=$'\\t' read -r kind path; do
+    [[ -n "${path:-}" ]] || continue
+    case "$kind" in
+      FILE) MODSEC_LOGS["$path"]=1 ;;
+      DIR)  MODSEC_STORAGE_DIRS["$path"]=1 ;;
+    esac
+  done < "$modsec_report"
 
   ((${#NGINX_ACCESS_LOGS[@]} > 0)) || die "No verified JSON Nginx access logs found. Agent installation aborted."
-  log "Nginx discovery: ${#NGINX_ACCESS_LOGS[@]} JSON access log(s), ${#NGINX_ERROR_LOGS[@]} text error log(s), ${#MODSEC_LOGS[@]} ModSecurity log(s)."
+  log "Nginx discovery: ${#NGINX_ACCESS_LOGS[@]} JSON access log(s), ${#NGINX_ERROR_LOGS[@]} text error log(s), ${#MODSEC_LOGS[@]} ModSecurity file log(s)."
+  if ((${#MODSEC_STORAGE_DIRS[@]} > 0)); then
+    log "ModSecurity Concurrent audit storage director(ies) recognized (not added as localfile directories):"
+    for path in "${!MODSEC_STORAGE_DIRS[@]}"; do
+      printf '  [MODSEC-STORAGE] %s\n' "$path"
+    done
+  fi
 }
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   log "Inspecting every active Nginx virtual host and validating JSON access logs..."
@@ -852,7 +926,10 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
       printf '  [MODSEC] %s\n' "$path"
     done
   else
-    warn "No SecAuditLog/SecDebugLog path was discovered from active Nginx ModSecurity rules files."
+    warn "No SecAuditLog/SecDebugLog file path was discovered from active Nginx ModSecurity rules files."
+    if ((${#MODSEC_STORAGE_DIRS[@]} > 0)); then
+      warn "SecAuditLogStorageDir was found, but its directory is not a valid Wazuh localfile path; inspect the Concurrent audit layout before adding transaction-file collection."
+    fi
   fi
 fi
 
@@ -881,7 +958,7 @@ cleanup_files(){
     fi
   fi
 
-  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}" "${NGINX_DUMP:-}" "${DISCOVERY_REPORT:-}"
+  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}" "${NGINX_DUMP:-}" "${DISCOVERY_REPORT:-}" "${MODSEC_REPORT:-}"
   cleanup
   exit "$exit_code"
 }
@@ -1223,7 +1300,10 @@ Brebes-WAF:
   log_format verified as a JSON object using escape=json. Explicit access_log off
   directives are skipped. Non-JSON or unsafe vhost access logs abort installation
   before package installation, enrollment, or Agent configuration changes.
-  Nginx error logs and discovered ModSecurity log paths are collected as syslog.
+  Nginx error logs and discovered SecAuditLog/SecDebugLog file paths are
+  collected as syslog. SecAuditLogStorageDir is recognized as a directory,
+  never incorrectly registered as a file. Concurrent transaction-file
+  collection is not guessed from the directory alone.
   Nginx and ModSecurity configurations are never modified.
   The installer backs up /var/ossec/etc/ossec.conf, stages the updated file,
   validates it with wazuh-agentd -t, and restores the backup if validation fails.
