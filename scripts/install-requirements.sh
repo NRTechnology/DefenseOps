@@ -1671,12 +1671,16 @@ conf = Path("/var/ossec/etc/ossec.conf")
 if not conf.is_file() or conf.is_symlink():
     raise SystemExit("ossec.conf aktif tidak ditemukan atau berupa symlink; menolak perubahan.")
 original = conf.read_text(encoding="utf-8")
+# Wazuh ossec.conf may contain multiple top-level <ossec_config>
+# sections. It is a valid Wazuh configuration format, but not a single-root
+# XML document. Wrap the complete content for XML well-formedness checks.
+xml_payload = re.sub(r"^\\s*<\\?xml[^?]*\\?>", "", original, count=1)
 try:
-    root = ET.fromstring(original)
+    root = ET.fromstring("<defenseops_config_root>" + xml_payload + "</defenseops_config_root>")
 except ET.ParseError as exc:
     raise SystemExit(f"ossec.conf tidak valid: {exc}")
 
-rulesets = root.findall("ruleset")
+rulesets = root.findall(".//ruleset")
 if len(rulesets) != 1:
     raise SystemExit(f"Ditemukan {len(rulesets)} blok <ruleset>; mengharapkan tepat satu.")
 
@@ -1687,8 +1691,9 @@ if "etc/rules" not in rule_dirs:
         raise SystemExit("Penutup </ruleset> tidak ditemukan; ossec.conf tidak diubah.")
     indent = match.group(1) + "  "
     updated = original[:match.start()] + f"{indent}<rule_dir>etc/rules</rule_dir>\n" + original[match.start():]
+    updated_payload = re.sub(r"^\\s*<\\?xml[^?]*\\?>", "", updated, count=1)
     try:
-        ET.fromstring(updated)
+        ET.fromstring("<defenseops_config_root>" + updated_payload + "</defenseops_config_root>")
     except ET.ParseError as exc:
         raise SystemExit(f"Penambahan rule_dir menghasilkan XML tidak valid: {exc}")
 
