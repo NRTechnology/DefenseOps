@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.1"
-SCRIPT_RELEASE="2026-11-08"
+SCRIPT_VERSION="1.5.0"
+SCRIPT_RELEASE="2026-11-09"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.4.1"
+INSTALLER_VERSION="1.5.0"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -178,8 +178,9 @@ Options:
   -h, --help               Show help
 
 At runtime, select Brebes-WAF or Docker-PHP.
-First-time installation requests an enrollment password. Existing Agents are
-updated in place without re-enrollment or package reinstall.
+First-time installation requests an enrollment password. Existing Agents
+are asked whether to reset configuration and re-enroll. If declined, existing
+identity/configuration are preserved and only missing profile settings are added.
 EOF
 }
 
@@ -217,13 +218,6 @@ if (( AGENT_PACKAGE_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
   ACTIVE_MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
 fi
 
-if (( AGENT_PACKAGE_INSTALLED == 1 )); then
-  if [[ -n "$MANAGER" && -n "$ACTIVE_MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
-    die "Installed Agent configuration uses Manager '${ACTIVE_MANAGER}'. Refusing to change it to '${MANAGER}'."
-  fi
-  [[ -n "$ACTIVE_MANAGER" ]] && MANAGER="$ACTIVE_MANAGER"
-fi
-
 AGENT_ENROLLED=0
 if (( AGENT_PACKAGE_INSTALLED == 1 )) &&
    [[ -s /var/ossec/etc/client.keys ]] &&
@@ -231,11 +225,49 @@ if (( AGENT_PACKAGE_INSTALLED == 1 )) &&
   AGENT_ENROLLED=1
 fi
 AGENT_WAS_ENROLLED="$AGENT_ENROLLED"
+RESET_EXISTING=0
 
+if [[ -z "$MANAGER" && -n "$ACTIVE_MANAGER" ]]; then
+  MANAGER="$ACTIVE_MANAGER"
+fi
 if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
   MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
 fi
 [[ -n "$MANAGER" ]] || die "Manager address unavailable. Use --manager or provide ossec.conf."
+
+if (( AGENT_PACKAGE_INSTALLED == 1 )); then
+  echo
+  echo "Existing Wazuh Agent installation detected."
+  echo "  Current Manager : ${ACTIVE_MANAGER:-not detected}"
+  if (( AGENT_ENROLLED == 1 )); then
+    echo "  Enrollment      : enrolled"
+  else
+    echo "  Enrollment      : not enrolled"
+  fi
+  echo
+  echo "  [Y] Reset existing Agent configuration and enroll again."
+  echo "      Current ossec.conf and client.keys will be backed up."
+  echo "  [N] Preserve existing Agent identity/configuration and add only"
+  echo "      missing settings for the selected profile."
+  read -r -p "Reset configuration and re-enroll? [y/N] " reset_answer
+  case "${reset_answer,,}" in
+    y|yes)
+      RESET_EXISTING=1
+      AGENT_ENROLLED=0
+      AGENT_WAS_ENROLLED=0
+      log "Reset requested; existing configuration and identity will be backed up."
+      ;;
+    *)
+      if [[ -n "$ACTIVE_MANAGER" ]]; then
+        if [[ -n "$MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
+          die "Installed Agent uses Manager '${ACTIVE_MANAGER}'. To change Manager, choose reset/re-enroll."
+        fi
+        MANAGER="$ACTIVE_MANAGER"
+      fi
+      log "Existing Agent identity and configuration will be preserved."
+      ;;
+  esac
+fi
 [[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address."
 [[ -n "$AGENT_NAME" ]] || AGENT_NAME="$(hostname -s)"
 [[ "$AGENT_NAME" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "Invalid agent name."
@@ -633,14 +665,62 @@ fi
 
 REG_PASSWORD=""
 TEMP_AUTHD_PASS=0
+RESET_APPLIED=0
+RESET_COMMITTED=0
+RESET_CONF_BACKUP=""
+RESET_KEYS_BACKUP=""
+RESET_SERVICE_WAS_ACTIVE=0
 cleanup(){
+  local cleanup_rc=$?
   if (( TEMP_AUTHD_PASS == 1 )); then
     rm -f /var/ossec/etc/authd.pass
     TEMP_AUTHD_PASS=0
   fi
+  if (( RESET_APPLIED == 1 && RESET_COMMITTED == 0 )); then
+    warn "Reset/enrollment did not complete. Restoring the previous Agent configuration and identity."
+    if [[ -s "$RESET_CONF_BACKUP" ]]; then
+      cp -a -- "$RESET_CONF_BACKUP" /var/ossec/etc/ossec.conf || warn "Could not restore previous ossec.conf."
+    fi
+    if [[ -n "$RESET_KEYS_BACKUP" && -s "$RESET_KEYS_BACKUP" ]]; then
+      cp -a -- "$RESET_KEYS_BACKUP" /var/ossec/etc/client.keys || warn "Could not restore previous client.keys."
+    else
+      rm -f /var/ossec/etc/client.keys
+    fi
+    if (( RESET_SERVICE_WAS_ACTIVE == 1 )); then
+      systemctl start wazuh-agent || warn "Could not restart Agent after reset rollback."
+    fi
+  fi
   unset REG_PASSWORD WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
+  return "$cleanup_rc"
 }
 trap cleanup EXIT
+
+if (( RESET_EXISTING == 1 )); then
+  [[ -s "$CONFIG_FILE" ]] || die "Generated baseline ossec.conf is missing; cannot reset safely."
+  [[ -s "$ACTIVE_AGENT_CONF" && ! -L "$ACTIVE_AGENT_CONF" ]] ||
+    die "Active ossec.conf is missing or is a symlink; refusing reset."
+  RESET_STAMP="$(date +%Y%m%d-%H%M%S)"
+  RESET_CONF_BACKUP="${ACTIVE_AGENT_CONF}.pre-defenseops-reset.${RESET_STAMP}.$$"
+  RESET_KEYS_BACKUP="/var/ossec/etc/client.keys.pre-defenseops-reset.${RESET_STAMP}.$$"
+  cp -a -- "$ACTIVE_AGENT_CONF" "$RESET_CONF_BACKUP"
+  if [[ -e /var/ossec/etc/client.keys ]]; then
+    cp -a -- /var/ossec/etc/client.keys "$RESET_KEYS_BACKUP"
+  else
+    RESET_KEYS_BACKUP=""
+  fi
+  RESET_APPLIED=1
+  if systemctl is-active --quiet wazuh-agent; then
+    RESET_SERVICE_WAS_ACTIVE=1
+    systemctl stop wazuh-agent
+  fi
+  RESET_TMP="$(mktemp "${ACTIVE_AGENT_CONF}.reset.XXXXXX")"
+  cp -- "$CONFIG_FILE" "$RESET_TMP"
+  chown --reference="$ACTIVE_AGENT_CONF" "$RESET_TMP"
+  chmod --reference="$ACTIVE_AGENT_CONF" "$RESET_TMP"
+  mv -f -- "$RESET_TMP" "$ACTIVE_AGENT_CONF"
+  rm -f /var/ossec/etc/client.keys
+  log "Existing ossec.conf reset to the generated DefenseOps baseline; previous files backed up."
+fi
 
 if (( AGENT_ENROLLED == 0 )); then
   read -r -s -p "Enrollment password for DefenseOps: " REG_PASSWORD
@@ -760,6 +840,20 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
     for path in "${!NGINX_ERROR_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
     for path in "${!MODSEC_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
   } | sort -u > "$PATHS_FILE"
+
+  for path in "${!MODSEC_LOGS[@]}"; do
+    if ! awk -F '\t' -v wanted="$path" '$1 == wanted { found=1 } END { exit(found ? 0 : 1) }' "$PATHS_FILE"; then
+      die "ModSecurity log was discovered but not added to the Agent collection manifest: ${path}"
+    fi
+  done
+  if ((${#MODSEC_LOGS[@]} > 0)); then
+    log "ModSecurity log collection paths verified:"
+    for path in "${!MODSEC_LOGS[@]}"; do
+      printf '  [MODSEC] %s\n' "$path"
+    done
+  else
+    warn "No SecAuditLog/SecDebugLog path was discovered from active Nginx ModSecurity rules files."
+  fi
 fi
 
 cleanup_files(){
@@ -992,6 +1086,12 @@ else
   die "Wazuh Agent did not become active. Check /var/ossec/logs/ossec.log."
 fi
 
+if (( RESET_APPLIED == 1 )); then
+  RESET_COMMITTED=1
+  log "Reset/re-enrollment completed. Previous ossec.conf backup: ${RESET_CONF_BACKUP}"
+  [[ -n "$RESET_KEYS_BACKUP" ]] && log "Previous client.keys backup: ${RESET_KEYS_BACKUP}"
+fi
+
 log "Installed Wazuh Agent version: $(/var/ossec/bin/wazuh-agentd -V 2>&1 | head -n1 || true)"
 log "Endpoint profile: ${ENDPOINT_PROFILE}"
 if (( AGENT_WAS_ENROLLED == 1 )); then
@@ -1177,5 +1277,5 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf, docker-php. Existing Agents are updated in place; no re-enrollment."
+log "Profiles: brebes-waf, docker-php. Existing Agents are prompted: reset/re-enroll or preserve and repair missing settings."
 log "No enrollment secret was copied or embedded."
