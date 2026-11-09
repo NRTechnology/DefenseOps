@@ -47,6 +47,7 @@ REPAIR_ARCHIVES_ONLY=0
 # Populated by finalize_manager_and_verify_archives() and displayed in summary.
 SUMMARY_GROUP_BREBES_WAF="NOT VERIFIED"
 SUMMARY_GROUP_DOCKER_PHP="NOT VERIFIED"
+SUMMARY_CUSTOM_ALERTS="NOT VERIFIED"
 SUMMARY_FILEBEAT_ALERTS="NOT VERIFIED"
 SUMMARY_FILEBEAT_ARCHIVES="NOT VERIFIED"
 SUMMARY_ARCHIVES_HARVESTER="NOT VERIFIED"
@@ -1649,6 +1650,214 @@ ensure_manager_agent_groups() {
         awk '$1 == "Brebes-WAF" || $1 == "docker-php"'
 }
 
+ensure_brebes_waf_custom_rules() {
+    log "Memastikan custom alert rules Brebes-WAF tersedia pada volume persisten Wazuh Manager..."
+
+    local container_id
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk pemasangan custom alert rules."
+
+    # Add the standard etc/rules rule directory only when it is missing.
+    # Existing Manager configuration is backed up and otherwise preserved.
+    docker exec -i "$container_id" python3 - <<'PYRULESET' || die "Gagal memastikan rule_dir etc/rules pada ossec.conf Manager."
+import re
+import shutil
+import tempfile
+from datetime import datetime
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+conf = Path("/var/ossec/etc/ossec.conf")
+if not conf.is_file() or conf.is_symlink():
+    raise SystemExit("ossec.conf aktif tidak ditemukan atau berupa symlink; menolak perubahan.")
+original = conf.read_text(encoding="utf-8")
+try:
+    root = ET.fromstring(original)
+except ET.ParseError as exc:
+    raise SystemExit(f"ossec.conf tidak valid: {exc}")
+
+rulesets = root.findall("ruleset")
+if len(rulesets) != 1:
+    raise SystemExit(f"Ditemukan {len(rulesets)} blok <ruleset>; mengharapkan tepat satu.")
+
+rule_dirs = [(node.text or "").strip() for node in rulesets[0].findall("rule_dir")]
+if "etc/rules" not in rule_dirs:
+    match = re.search(r"(?m)^([ \t]*)</ruleset\s*>", original)
+    if not match:
+        raise SystemExit("Penutup </ruleset> tidak ditemukan; ossec.conf tidak diubah.")
+    indent = match.group(1) + "  "
+    updated = original[:match.start()] + f"{indent}<rule_dir>etc/rules</rule_dir>\n" + original[match.start():]
+    try:
+        ET.fromstring(updated)
+    except ET.ParseError as exc:
+        raise SystemExit(f"Penambahan rule_dir menghasilkan XML tidak valid: {exc}")
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = conf.with_name(conf.name + ".defenseops-backup-" + stamp)
+    shutil.copy2(conf, backup)
+    fd, tmp_name = tempfile.mkstemp(prefix=".ossec.conf.", dir=str(conf.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(updated)
+            stream.flush()
+        shutil.copystat(conf, tmp_name)
+        Path(tmp_name).replace(conf)
+    except Exception:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+    print(f"Added <rule_dir>etc/rules</rule_dir>; backup: {backup}")
+else:
+    print("Rule directory etc/rules already configured; preserved.")
+PYRULESET
+
+    # Create the custom rules file only when it does not already exist.
+    # Existing files are never overwritten; their expected rules are validated.
+    docker exec -i "$container_id" python3 - <<'PYRULES' || die "Gagal memasang atau memvalidasi custom rules Brebes-WAF."
+from pathlib import Path
+import os
+import grp
+import tempfile
+import xml.etree.ElementTree as ET
+
+rules_path = Path("/var/ossec/etc/rules/defenseops_modsecurity_rules.xml")
+if rules_path.is_symlink():
+    raise SystemExit(f"Custom rules path berupa symlink; menolak perubahan: {rules_path}")
+if not rules_path.parent.exists():
+    rules_path.parent.mkdir(parents=True, mode=0o750)
+    os.chown(rules_path.parent, 0, grp.getgrnam("wazuh").gr_gid)
+    os.chmod(rules_path.parent, 0o750)
+
+rules_xml = """<group name="defenseops,modsecurity,">
+
+  <!-- Base event: DefenseOps ModSecurity -->
+  <rule id="100500" level="3">
+    <if_sid>86600</if_sid>
+    <decoded_as>json</decoded_as>
+    <field name="integration">^brebes-waf$</field>
+    <description>DefenseOps: ModSecurity event received.</description>
+    <group>defenseops,modsecurity,</group>
+  </rule>
+
+  <!-- Generic detection -->
+  <rule id="100501" level="7">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^waf_detection$</field>
+    <description>DefenseOps: ModSecurity detected a suspicious request.</description>
+    <group>web,attack,modsecurity_detection,</group>
+  </rule>
+
+  <!-- Generic block -->
+  <rule id="100502" level="10">
+    <if_sid>100500</if_sid>
+    <field name="event_type">^waf_block$</field>
+    <description>DefenseOps: ModSecurity blocked a request.</description>
+    <group>web,attack,modsecurity_block,</group>
+  </rule>
+
+  <!-- OWASP CRS detection -->
+  <rule id="100503" level="7">
+    <if_sid>100501</if_sid>
+    <field name="waf.rule_source">^OWASP_CRS$</field>
+    <description>DefenseOps: OWASP CRS detected an attack.</description>
+    <group>web,attack,owasp_crs,modsecurity_detection,</group>
+  </rule>
+
+  <!-- Brebes-WAF detection -->
+  <rule id="100504" level="8">
+    <if_sid>100501</if_sid>
+    <field name="waf.rule_source">^Brebes-WAF$</field>
+    <description>DefenseOps: Brebes-WAF detected an attack.</description>
+    <group>web,attack,brebes_waf,modsecurity_detection,</group>
+  </rule>
+
+  <!-- Brebes-WAF block -->
+  <rule id="100505" level="12">
+    <if_sid>100502</if_sid>
+    <field name="waf.rule_source">^Brebes-WAF$</field>
+    <description>DefenseOps: Brebes-WAF blocked an attack.</description>
+    <group>web,attack,brebes_waf,modsecurity_block,</group>
+  </rule>
+
+  <!-- OWASP CRS block -->
+  <rule id="100506" level="10">
+    <if_sid>100502</if_sid>
+    <field name="waf.rule_source">^OWASP_CRS$</field>
+    <description>DefenseOps: OWASP CRS blocked an attack.</description>
+    <group>web,attack,owasp_crs,modsecurity_block,</group>
+  </rule>
+
+</group>
+"""
+
+expected = {
+    "100500": ("3", "86600", None, "integration", "^brebes-waf$"),
+    "100501": ("7", "100500", None, "event_type", "^waf_detection$"),
+    "100502": ("10", "100500", None, "event_type", "^waf_block$"),
+    "100503": ("7", "100501", None, "waf.rule_source", "^OWASP_CRS$"),
+    "100504": ("8", "100501", None, "waf.rule_source", "^Brebes-WAF$"),
+    "100505": ("12", "100502", None, "waf.rule_source", "^Brebes-WAF$"),
+    "100506": ("10", "100502", None, "waf.rule_source", "^OWASP_CRS$"),
+}
+
+def validate(path: Path):
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise SystemExit(f"Custom rules XML tidak valid: {exc}")
+    found = {}
+    for rule in root.iter("rule"):
+        rid = rule.get("id")
+        if rid in expected:
+            if rid in found:
+                raise SystemExit(f"Rule ID duplikat ditemukan: {rid}")
+            found[rid] = rule
+    missing = sorted(set(expected) - set(found))
+    if missing:
+        raise SystemExit("Custom rules yang sudah ada tidak lengkap; file dipertahankan. Missing IDs: " + ", ".join(missing))
+    for rid, (level, parent, _unused, field_name, field_value) in expected.items():
+        rule = found[rid]
+        if rule.get("level") != level:
+            raise SystemExit(f"Rule {rid}: level tidak sesuai; file dipertahankan.")
+        if (rule.findtext("if_sid") or "").strip() != parent:
+            raise SystemExit(f"Rule {rid}: if_sid tidak sesuai; file dipertahankan.")
+        field = next((node for node in rule.findall("field") if node.get("name") == field_name), None)
+        if field is None or (field.text or "").strip() != field_value:
+            raise SystemExit(f"Rule {rid}: field {field_name} tidak sesuai; file dipertahankan.")
+    if (found["100500"].findtext("decoded_as") or "").strip() != "json":
+        raise SystemExit("Rule 100500 tidak memiliki decoded_as=json; file dipertahankan.")
+    print("Validated custom rules IDs: " + ", ".join(sorted(found, key=int)))
+
+if rules_path.exists():
+    if not rules_path.is_file():
+        raise SystemExit(f"Custom rules path bukan file reguler; menolak perubahan: {rules_path}")
+    validate(rules_path)
+    print("Existing custom rules file preserved; no overwrite.")
+else:
+    ET.fromstring(rules_xml)
+    fd, tmp_name = tempfile.mkstemp(prefix=".defenseops_modsecurity_rules.", dir=str(rules_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(rules_xml)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp_name, 0o640)
+        os.chown(tmp_name, 0, grp.getgrnam("wazuh").gr_gid)
+        os.replace(tmp_name, rules_path)
+    except Exception:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+    validate(rules_path)
+    print(f"Installed custom rules file: {rules_path}")
+PYRULES
+
+    # Validate Manager configuration and custom rules without restarting here.
+    docker exec "$container_id" /var/ossec/bin/wazuh-analysisd -t \
+        || die "wazuh-analysisd menolak konfigurasi/custom rules. Manager tidak direstart."
+    SUMMARY_CUSTOM_ALERTS="OK (100500-100506)"
+    ok "Custom alert rules Brebes-WAF tervalidasi; akan dimuat pada restart Manager yang sudah ada."
+}
+
+
 deploy_wazuh() {
     log "Menyiapkan deployment Wazuh ${WAZUH_VERSION}..."
     create_docker_network
@@ -1674,6 +1883,7 @@ deploy_wazuh() {
     compose_up manager
     ensure_manager_agent_enrollment
     ensure_manager_agent_groups
+    ensure_brebes_waf_custom_rules
     configure_effective_manager_archives
     wait_for_manager
     configure_manager_api_tls
@@ -1946,6 +2156,7 @@ print_installation_summary() {
     printf '\n%b[ AGENT GROUPS ]%b\n' "$BLUE" "$NC"
     printf 'Brebes-WAF            : %s\n' "$SUMMARY_GROUP_BREBES_WAF"
     printf 'docker-php            : %s\n' "$SUMMARY_GROUP_DOCKER_PHP"
+    printf 'Brebes-WAF custom rules: %s\n' "$SUMMARY_CUSTOM_ALERTS"
 
     printf '\n%b[ FILEBEAT ARCHIVES ]%b\n' "$BLUE" "$NC"
     printf 'Filebeat Alerts       : %s\n' "$SUMMARY_FILEBEAT_ALERTS"
@@ -2039,6 +2250,7 @@ main() {
         log "NTP/chrony -> optional timezone Asia/Jakarta -> enrollment password use_password=yes in persistent wazuh_etc volume."
         log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
         log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
+        log "Custom alert rules Brebes-WAF: install idempotent 100500-100506 ke volume Manager; validasi analysisd; tanpa restart tambahan."
         exit 0
     fi
 
