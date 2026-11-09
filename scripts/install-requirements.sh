@@ -44,6 +44,16 @@ LOG_FILE="${LOG_FILE:-/var/log/defenseops-install-requirements.log}"
 DRY_RUN=0
 REPAIR_ARCHIVES_ONLY=0
 
+# Populated by finalize_manager_and_verify_archives() and displayed in summary.
+SUMMARY_GROUP_BREBES_WAF="NOT VERIFIED"
+SUMMARY_GROUP_DOCKER_PHP="NOT VERIFIED"
+SUMMARY_FILEBEAT_ALERTS="NOT VERIFIED"
+SUMMARY_FILEBEAT_ARCHIVES="NOT VERIFIED"
+SUMMARY_ARCHIVES_HARVESTER="NOT VERIFIED"
+SUMMARY_ARCHIVES_PIPELINE="NOT VERIFIED"
+SUMMARY_ARCHIVES_INDEX="$WAZUH_ARCHIVE_INDEX_PATTERN"
+SUMMARY_ARCHIVES_INDEX_HEALTH="NOT VERIFIED"
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log()  { printf "%b[INFO]%b %s\n" "$BLUE" "$NC" "$*"; }
 ok()   { printf "%b[ OK ]%b %s\n" "$GREEN" "$NC" "$*"; }
@@ -1706,45 +1716,87 @@ finalize_manager_and_verify_archives() {
         printf '%s\n' "$groups_output" |
             awk -v wanted="$group" '$1 == wanted && $2 ~ /^\([0-9]+\)$/ { found=1 } END { exit !found }' \
             || die "Agent group '${group}' tidak ditemukan setelah final restart."
+        case "$group" in
+            Brebes-WAF) SUMMARY_GROUP_BREBES_WAF="OK" ;;
+            docker-php) SUMMARY_GROUP_DOCKER_PHP="OK" ;;
+        esac
         ok "Agent group '${group}' terverifikasi."
     done
 
-    # Wait until the Filebeat process started by this restart reports archives
-    # enabled and confirms that it has opened archives.json.
-    log "Memverifikasi Filebeat archives setelah restart Manager (maksimal 5 menit)..."
-    local filebeat_ready=0
+    # Wait until the Filebeat process started by this restart reports alerts
+    # and archives enabled, starts the archives harvester, and loads its pipeline.
+    log "Memverifikasi Filebeat alerts, archives, harvester, dan pipeline (maksimal 5 menit)..."
+    local filebeat_ready=0 pipeline_ready=0
     for attempt in $(seq 1 60); do
         logs="$(docker logs --since "$restart_time" "$manager_id" 2>&1 || true)"
+
         if printf '%s\n' "$logs" |
-            grep -E 'Enabled modules/filesets: wazuh \(archives, alerts\)|Enabled modules/filesets: wazuh \(alerts, archives\)' >/dev/null \
-            && printf '%s\n' "$logs" |
-            grep -F 'Harvester started for file: /var/ossec/logs/archives/archives.json' >/dev/null; then
+            grep -E 'Enabled modules/filesets: wazuh \(archives, alerts\)|Enabled modules/filesets: wazuh \(alerts, archives\)' >/dev/null; then
             filebeat_ready=1
+        fi
+
+        if printf '%s\n' "$logs" |
+            grep -F 'Harvester started for file: /var/ossec/logs/archives/archives.json' >/dev/null; then
+            SUMMARY_ARCHIVES_HARVESTER="running"
+        fi
+
+        if printf '%s\n' "$logs" |
+            grep -F 'filebeat-7.10.2-wazuh-archives-pipeline' >/dev/null; then
+            pipeline_ready=1
+        fi
+
+        if (( filebeat_ready == 1 )) &&
+           [[ "$SUMMARY_ARCHIVES_HARVESTER" == "running" ]] &&
+           (( pipeline_ready == 1 )); then
             break
         fi
         sleep 5
     done
+
     (( filebeat_ready == 1 )) || {
         docker logs --since "$restart_time" "$manager_id" 2>&1 | tail -n 120 >&2 || true
-        die "Filebeat belum mengaktifkan archives atau archives.json belum dibaca setelah restart."
+        die "Filebeat belum mengaktifkan alerts dan archives setelah restart."
     }
-    ok "Filebeat aktif dengan modul alerts dan archives; harvester archives.json berjalan."
+    SUMMARY_FILEBEAT_ALERTS="enabled"
+    SUMMARY_FILEBEAT_ARCHIVES="enabled"
+    [[ "$SUMMARY_ARCHIVES_HARVESTER" == "running" ]] \
+        || die "Filebeat archives aktif tetapi harvester archives.json belum berjalan."
+    (( pipeline_ready == 1 )) \
+        || die "Filebeat archives aktif tetapi archives pipeline belum terdeteksi pada log."
+    SUMMARY_ARCHIVES_PIPELINE="loaded"
+    ok "Filebeat alerts dan archives aktif; harvester berjalan; pipeline loaded."
 
-    # Verify the archive index is actually created in the Indexer. This is
-    # stronger than checking only the local Filebeat configuration.
+    # Verify the archive index is actually created in the Indexer.
     log "Menunggu index ${WAZUH_ARCHIVE_INDEX_PATTERN} terbentuk (maksimal 5 menit)..."
-    local index_response index_count
+    local index_response index_count index_health
     for attempt in $(seq 1 60); do
         index_response="$(curl -ksS --connect-timeout 5 --max-time 15 \
             -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
             'https://127.0.0.1:9200/_cat/indices/wazuh-archives-4.x-*?format=json' 2>/dev/null || true)"
         index_count="$(printf '%s' "$index_response" | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || printf '0')"
+
         if [[ "$index_count" =~ ^[0-9]+$ ]] && (( index_count > 0 )); then
-            printf '%s\n' "$index_response" | jq -r '.[] | "  \(.health) \(.status) \(.index) docs=\(.["docs.count"])"'
-            printf '%s\n' "$index_response" | jq -e 'length > 0 and all(.[]; .health == "green" or .health == "yellow")' >/dev/null \
-                || die "Archives index ditemukan tetapi health bukan green/yellow."
-            ok "Wazuh archives aktif dan index sudah terbentuk di Indexer."
-            return
+            printf '%s\n' "$index_response" |
+                jq -r '.[] | "  \(.health) \(.status) \(.index) docs=\(.["docs.count"])"'
+
+            index_health="$(printf '%s' "$index_response" |
+                jq -r 'if length == 0 then "NOT FOUND"
+                       elif any(.[]; .health == "red") then "red"
+                       elif any(.[]; .health == "yellow") then "yellow"
+                       elif all(.[]; .health == "green") then "green"
+                       else "unknown" end')"
+
+            case "$index_health" in
+                green|yellow)
+                    SUMMARY_ARCHIVES_INDEX_HEALTH="$index_health"
+                    SUMMARY_ARCHIVES_INDEX="$WAZUH_ARCHIVE_INDEX_PATTERN"
+                    ok "Wazuh archives aktif; index health ${index_health}."
+                    return
+                    ;;
+                *)
+                    die "Archives index ditemukan tetapi health=${index_health}."
+                    ;;
+            esac
         fi
         sleep 5
     done
@@ -1890,6 +1942,18 @@ print_installation_summary() {
     printf 'Manager use_password  : %s\n' "$enrollment_state"
     printf 'Persistent authd.pass : %s\n' "$(docker exec defenseops-manager-wazuh.manager-1 test -s /var/ossec/etc/authd.pass && printf OK || printf MISSING)"
     printf 'Enrollment Listener   : %s\n' "$(ss -lnt 2>/dev/null | awk '$4 ~ /:1515$/ {found=1} END {print found ? "1515/TCP LISTENING" : "NOT LISTENING"}')"
+
+    printf '\n%b[ AGENT GROUPS ]%b\n' "$BLUE" "$NC"
+    printf 'Brebes-WAF            : %s\n' "$SUMMARY_GROUP_BREBES_WAF"
+    printf 'docker-php            : %s\n' "$SUMMARY_GROUP_DOCKER_PHP"
+
+    printf '\n%b[ FILEBEAT ARCHIVES ]%b\n' "$BLUE" "$NC"
+    printf 'Filebeat Alerts       : %s\n' "$SUMMARY_FILEBEAT_ALERTS"
+    printf 'Filebeat Archives     : %s\n' "$SUMMARY_FILEBEAT_ARCHIVES"
+    printf 'Archives Harvester    : %s\n' "$SUMMARY_ARCHIVES_HARVESTER"
+    printf 'Archives Pipeline     : %s\n' "$SUMMARY_ARCHIVES_PIPELINE"
+    printf 'Archives Index        : %s\n' "$SUMMARY_ARCHIVES_INDEX"
+    printf 'Archives Index Health : %s\n' "$SUMMARY_ARCHIVES_INDEX_HEALTH"
 
     printf '\n%b[ LOG COLLECTION & RETENTION ]%b\n' "$BLUE" "$NC"
     printf 'Raw JSON Events       : enabled (Manager logall_json=yes)\n'
