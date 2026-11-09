@@ -668,105 +668,29 @@ print(f"Backup: {backup}")
 PYFILEBEAT
 )" || die "Gagal memperbarui filebeat.yml pada volume persisten."
 
-    # Confirm the container sees the exact host-volume change and validate it.
+    # Confirm the container sees the persistent host-volume configuration.
     docker exec "$container_id" sh -c \
         'awk "/^[[:space:]]*archives:/ {in_archives=1; next} in_archives && /^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*$/ {ok=1; exit} in_archives && /^[^[:space:]]/ {exit} END {exit !ok}" /etc/filebeat/filebeat.yml' \
         || die "Container tidak membaca archives.enabled=true dari volume persisten."
+
+    # Validate configuration and output without signalling/restarting any
+    # s6 service or restarting the Wazuh Manager container. In this Wazuh
+    # image, s6-svc -r can initiate container shutdown rather than safely
+    # restarting only Filebeat.
     docker exec "$container_id" filebeat test config -c /etc/filebeat/filebeat.yml -e \
         || die "Validasi konfigurasi Filebeat gagal."
-
-    if [[ "$changed" == CHANGED* ]]; then
-        # Restart only the supervised Filebeat service; keep Manager, agents,
-        # Indexer and Dashboard processes untouched.
-        docker exec "$container_id" sh -c '
-            set -eu
-            command -v s6-svc >/dev/null 2>&1 || {
-                echo "s6-svc tidak ditemukan." >&2
-                exit 20
-            }
-            command -v s6-svstat >/dev/null 2>&1 || {
-                echo "s6-svstat tidak ditemukan." >&2
-                exit 20
-            }
-
-            # Resolve the actual s6 service directory used by this container.
-            service_dir=""
-            for candidate in \
-                /run/s6/services/filebeat \
-                /var/run/s6/services/filebeat \
-                /run/service/filebeat; do
-                if [ -d "$candidate" ]; then
-                    service_dir="$candidate"
-                    break
-                fi
-            done
-            [ -n "$service_dir" ] || {
-                echo "Direktori service Filebeat tidak ditemukan." >&2
-                exit 21
-            }
-
-            # s6-svstat is authoritative for the supervised service PID.
-            # Do not use pgrep -xo: process selection can be ambiguous.
-            before_status="$(s6-svstat "$service_dir" 2>&1)" || {
-                echo "Gagal membaca status service sebelum restart: $before_status" >&2
-                exit 22
-            }
-            old_pid="$(printf "%s\\n" "$before_status" |
-                sed -n "s/^up (pid \\([0-9][0-9]*\\)).*/\\1/p")"
-            [ -n "$old_pid" ] || {
-                echo "Service Filebeat belum berstatus up: $before_status" >&2
-                exit 22
-            }
-            echo "Filebeat status before restart: $before_status"
-
-            # Restart only the Filebeat service. Preserve the Manager container.
-            if restart_output="$(s6-svc -r "$service_dir" 2>&1)"; then
-                [ -z "$restart_output" ] || echo "$restart_output"
-            else
-                restart_rc=$?
-                echo "s6-svc -r gagal (exit $restart_rc): $restart_output" >&2
-                exit 23
-            fi
-
-            # Wait for s6 to report the service up with a new supervised PID.
-            new_pid=""
-            after_status=""
-            attempt=0
-            while [ "$attempt" -lt 30 ]; do
-                after_status="$(s6-svstat "$service_dir" 2>&1 || true)"
-                new_pid="$(printf "%s\\n" "$after_status" |
-                    sed -n "s/^up (pid \\([0-9][0-9]*\\)).*/\\1/p")"
-
-                if [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ]; then
-                    break
-                fi
-                sleep 1
-                attempt=$((attempt + 1))
-            done
-
-            [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] || {
-                echo "Service Filebeat tidak kembali up dengan PID baru dalam 30 detik." >&2
-                echo "PID lama: $old_pid; status terakhir: ${after_status:-tidak tersedia}" >&2
-                exit 24
-            }
-
-            kill -0 "$new_pid" 2>/dev/null || {
-                echo "PID Filebeat baru $new_pid tidak hidup." >&2
-                exit 25
-            }
-            echo "Filebeat restarted and verified: PID $old_pid -> $new_pid (service: $service_dir)"
-            echo "Filebeat status after restart: $after_status"
-        ' || die "Konfigurasi sudah tersimpan, tetapi restart/verifikasi service Filebeat gagal. Container Manager tidak direstart. Periksa detail error di atas."
-        log "Filebeat service berhasil direstart secara terpisah; container Manager tetap berjalan."
-    else
-        log "archives.enabled sudah true; tidak ada perubahan atau restart dilakukan."
-    fi
-
     docker exec "$container_id" filebeat test output -c /etc/filebeat/filebeat.yml -e \
         || die "Filebeat tidak dapat terhubung ke Wazuh Indexer."
-    ok "Filebeat archives.enabled=true tersimpan pada volume host dan tervalidasi."
-}
 
+    if [[ "$changed" == CHANGED* ]]; then
+        log "archives.enabled=true berhasil disimpan pada volume persisten."
+        warn "Filebeat yang sedang berjalan belum dimuat ulang. Perubahan akan aktif setelah Manager container direstart pada maintenance window terencana."
+    else
+        log "archives.enabled sudah true; tidak ada perubahan konfigurasi atau restart dilakukan."
+    fi
+
+    ok "Filebeat archives.enabled=true tersimpan dan konfigurasi/output tervalidasi."
+}
 configure_effective_manager_archives() {
     log "Memastikan konfigurasi Archives pada ossec.conf aktif di volume Manager..."
     local container_id="" result=""
