@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 SCRIPT_RELEASE="2026-11-09"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.6.0"
+INSTALLER_VERSION="1.7.0"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -300,8 +300,13 @@ fi
 # ---------------------------------------------------------------------------
 declare -A NGINX_ACCESS_LOGS=()
 declare -A NGINX_ERROR_LOGS=()
-declare -A MODSEC_LOGS=()
+declare -A MODSEC_AUDIT_FILES=()
+declare -A MODSEC_DEBUG_FILES=()
 declare -A MODSEC_STORAGE_DIRS=()
+MODSEC_AUDIT_TYPE="Serial"
+MODSEC_COLLECTOR_ENABLED=0
+MODSEC_JSON_LOG="/var/log/defenseops/modsecurity-events.json"
+declare -a MODSEC_PARSER_ROOTS=()
 NGINX_DUMP=""
 DISCOVERY_REPORT=""
 MODSEC_REPORT=""
@@ -353,7 +358,9 @@ for raw in nginx_dump.read_text(encoding="utf-8", errors="replace").splitlines()
 
 seen_files = set()
 audit_files = set()
+debug_files = set()
 storage_dirs = set()
+audit_types = set()
 queue = list(rules_files)
 
 while queue:
@@ -385,9 +392,19 @@ while queue:
         directive = words[0].lower()
         value = words[1].removesuffix(";")
 
-        if directive in ("secauditlog", "secdebuglog"):
+        if directive == "secauditlog":
             if is_concrete_absolute_path(value):
                 audit_files.add(value)
+            continue
+
+        if directive == "secdebuglog":
+            if is_concrete_absolute_path(value):
+                debug_files.add(value)
+            continue
+
+        if directive == "secauditlogtype":
+            if value.lower() in ("serial", "concurrent"):
+                audit_types.add(value.capitalize())
             continue
 
         if directive == "secauditlogstoragedir":
@@ -406,9 +423,17 @@ while queue:
 
 with report_path.open("w", encoding="utf-8") as out:
     for path in sorted(audit_files):
-        out.write(f"FILE\t{path}\n")
+        out.write(f"AUDIT_FILE\t{path}\n")
+    for path in sorted(debug_files):
+        out.write(f"DEBUG_FILE\t{path}\n")
     for path in sorted(storage_dirs):
         out.write(f"DIR\t{path}\n")
+    if not audit_types and storage_dirs:
+        audit_types.add("Concurrent")
+    if len(audit_types) > 1:
+        raise SystemExit("Conflicting SecAuditLogType directives found: " + ", ".join(sorted(audit_types)))
+    for audit_type in sorted(audit_types):
+        out.write(f"TYPE\t{audit_type}\n")
 PYMODSEC
 }
 
@@ -681,23 +706,482 @@ PYNGINX
   # Discover ModSecurity audit/debug files from every active
   # modsecurity_rules_file and its recursive Include tree.
   discover_modsecurity_files "$dump_file" "$modsec_report"
-  while IFS=$'\\t' read -r kind path; do
+  while IFS=$'\t' read -r kind path; do
     [[ -n "${path:-}" ]] || continue
     case "$kind" in
-      FILE) MODSEC_LOGS["$path"]=1 ;;
-      DIR)  MODSEC_STORAGE_DIRS["$path"]=1 ;;
+      AUDIT_FILE) MODSEC_AUDIT_FILES["$path"]=1 ;;
+      DEBUG_FILE) MODSEC_DEBUG_FILES["$path"]=1 ;;
+      DIR)        MODSEC_STORAGE_DIRS["$path"]=1 ;;
+      TYPE)       MODSEC_AUDIT_TYPE="$path" ;;
     esac
   done < "$modsec_report"
 
   ((${#NGINX_ACCESS_LOGS[@]} > 0)) || die "No verified JSON Nginx access logs found. Agent installation aborted."
-  log "Nginx discovery: ${#NGINX_ACCESS_LOGS[@]} JSON access log(s), ${#NGINX_ERROR_LOGS[@]} text error log(s), ${#MODSEC_LOGS[@]} ModSecurity file log(s)."
-  if ((${#MODSEC_STORAGE_DIRS[@]} > 0)); then
-    log "ModSecurity Concurrent audit storage director(ies) recognized (not added as localfile directories):"
+  log "Nginx discovery: ${#NGINX_ACCESS_LOGS[@]} JSON access log(s), ${#NGINX_ERROR_LOGS[@]} text error log(s)."
+  log "ModSecurity discovery: ${#MODSEC_AUDIT_FILES[@]} SecAuditLog file(s), ${#MODSEC_DEBUG_FILES[@]} SecDebugLog file(s), ${#MODSEC_STORAGE_DIRS[@]} SecAuditLogStorageDir director(ies); audit type=${MODSEC_AUDIT_TYPE}."
+  if [[ "$MODSEC_AUDIT_TYPE" == "Concurrent" ]]; then
     for path in "${!MODSEC_STORAGE_DIRS[@]}"; do
-      printf '  [MODSEC-STORAGE] %s\n' "$path"
+      [[ -d "$path" ]] || { warn "SecAuditLogStorageDir does not exist yet: $path"; continue; }
+      MODSEC_PARSER_ROOTS+=("$path")
+      printf '  [MODSEC-AUDIT-ROOT] %s\n' "$path"
+    done
+    if ((${#MODSEC_PARSER_ROOTS[@]} == 0)) && ((${#MODSEC_AUDIT_FILES[@]} > 0)); then
+      warn "SecAuditLogType Concurrent was found, but no existing SecAuditLogStorageDir was found. SecAuditLog index files are not transaction logs; collector will not guess a directory."
+    fi
+  else
+    for path in "${!MODSEC_AUDIT_FILES[@]}"; do
+      [[ -f "$path" ]] || { warn "SecAuditLog file does not exist yet: $path"; continue; }
+      MODSEC_PARSER_ROOTS+=("$path")
+      printf '  [MODSEC-AUDIT-FILE] %s\n' "$path"
     done
   fi
+  for path in "${!MODSEC_DEBUG_FILES[@]}"; do
+    if [[ -e "$path" ]]; then
+      printf '  [MODSEC-DEBUG-LOG] %s (discovered; not used as audit event source)\n' "$path"
+    else
+      warn "SecDebugLog path does not exist yet: $path"
+    fi
+  done
+  if ((${#MODSEC_PARSER_ROOTS[@]} > 0)); then
+    MODSEC_COLLECTOR_ENABLED=1
+    log "ModSecurity audit parser enabled with ${#MODSEC_PARSER_ROOTS[@]} root path(s)."
+  else
+    warn "No usable ModSecurity audit source was found. Wazuh Agent will still collect Nginx logs; ModSecurity JSON collection is skipped."
+  fi
 }
+
+stage_modsecurity_collector(){
+  (( MODSEC_COLLECTOR_ENABLED == 1 )) || return 0
+
+  local lib_dir="/usr/local/libexec"
+  local config_dir="/etc/defenseops"
+  local state_dir="/var/lib/defenseops"
+  local log_dir="/var/log/defenseops"
+  local parser="${lib_dir}/defenseops-modsecurity-collector.py"
+  local parser_tmp="${lib_dir}/.defenseops-modsecurity-collector.py.tmp.$$"
+  local config="${config_dir}/modsecurity-collector.json"
+
+  install -d -o root -g root -m 0755 "$lib_dir" "$config_dir"
+  install -d -o root -g root -m 0750 "$state_dir"
+  if getent group wazuh >/dev/null 2>&1; then
+    install -d -o root -g wazuh -m 0750 "$log_dir"
+  else
+    install -d -o root -g root -m 0750 "$log_dir"
+  fi
+
+  cat > "$parser_tmp" <<'PYCOLLECTOR'
+#!/usr/bin/env python3
+"""Normalize ModSecurity Concurrent/Serial audit transactions into DefenseOps JSONL."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import socket
+import sqlite3
+import sys
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+MARKER_RE = re.compile(r'^---[A-Za-z0-9]+---([A-Z])--\s*$', re.M)
+ATTR_RE = re.compile(r'\[(\w+) "((?:\\.|[^"\\])*)"\]')
+REQUEST_RE = re.compile(r'^([A-Z]+)\s+(\S+)\s+HTTP/\d(?:\.\d)?$')
+SENSITIVE_RE = re.compile(
+    r'(?i)(password|passwd|token|secret|authorization|session(?:id)?|api[_-]?key|set-cookie|cookie)([=: ]+)([^&\s,;]+)'
+)
+COOKIE_VALUE_RE = re.compile(r'(?i)(cookie(?:s)?[^=]*=)[^;\s]+')
+SENSITIVE_QUERY_KEYS = re.compile(
+    r'(?i)(password|passwd|token|secret|authorization|session(?:id)?|api[_-]?key)'
+)
+
+
+def unquote(value: str) -> str:
+    return value.replace(r'\"', '"').replace(r'\\', '\\')
+
+
+def parse_sections(raw: str) -> dict[str, str]:
+    parts = MARKER_RE.split(raw)
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+
+
+def attrs(line: str) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for key, value in ATTR_RE.findall(line):
+        result.setdefault(key, []).append(unquote(value))
+    return result
+
+
+def first(values: dict[str, list[str]], key: str, default=None):
+    items = values.get(key) or []
+    return items[0] if items else default
+
+
+def sanitize(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = SENSITIVE_RE.sub(
+        lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]', value
+    )
+    value = COOKIE_VALUE_RE.sub(r'\1[REDACTED]', value)
+    return value[:2048]
+
+
+def sanitize_uri(uri: str | None) -> str | None:
+    if not uri:
+        return uri
+    try:
+        parts = urlsplit(uri)
+        query = urlencode([
+            (key, '[REDACTED]' if SENSITIVE_QUERY_KEYS.search(key) else value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ])
+        return urlunsplit(('', '', parts.path, query, parts.fragment))[:4096]
+    except Exception:
+        return sanitize(uri)
+
+
+def source_for(rule_file: str, tags: list[str]) -> str:
+    normalized = rule_file.lower()
+    lower_tags = {tag.lower() for tag in tags}
+    if '/opt/brebes-waf/rules/' in normalized or 'brebes-waf' in lower_tags:
+        return 'Brebes-WAF'
+    if (
+        '/modsecurity-crs/' in normalized
+        or 'owasp_crs' in lower_tags
+        or 'owasp-crs' in lower_tags
+    ):
+        return 'OWASP_CRS'
+    return 'unknown'
+
+
+def parse_audit(path: Path, hostname: str) -> list[dict]:
+    try:
+        raw = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        raise
+    if not re.search(r'(?m)^---[A-Za-z0-9]+---Z--\s*$', raw):
+        return []
+
+    sections = parse_sections(raw)
+    a_lines = (sections.get('A') or '').strip().splitlines()
+    if not a_lines:
+        return []
+    match = re.match(
+        r'^\[(.+?)\]\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)',
+        a_lines[0].strip()
+    )
+    if not match:
+        return []
+
+    date_text, txid, client_ip, _client_port, server_ip, server_port = match.groups()
+    try:
+        timestamp = dt.datetime.strptime(
+            date_text, '%d/%b/%Y:%H:%M:%S %z'
+        ).isoformat()
+    except ValueError:
+        timestamp = date_text
+
+    b_lines = (sections.get('B') or '').splitlines()
+    request_line = next(
+        (line.strip() for line in b_lines if REQUEST_RE.match(line.strip())), ''
+    )
+    request_match = REQUEST_RE.match(request_line)
+    method, uri = request_match.groups() if request_match else (None, None)
+
+    headers: dict[str, str] = {}
+    for line in b_lines:
+        if ':' not in line or line.startswith((' ', '\t')):
+            continue
+        key, value = line.split(':', 1)
+        if key.lower() in {'host', 'user-agent', 'referer'}:
+            headers[key.lower()] = value.strip()
+
+    status_match = re.search(
+        r'(?m)^HTTP/\S+\s+(\d{3})', sections.get('F') or ''
+    )
+    status = int(status_match.group(1)) if status_match else None
+    host = headers.get('host')
+    scheme = (
+        'https' if server_port == '443'
+        else 'http' if server_port == '80'
+        else None
+    )
+
+    h_lines = [
+        line.strip()
+        for line in (sections.get('H') or '').splitlines()
+        if line.strip().startswith('ModSecurity:')
+    ]
+    events = []
+    for line in h_lines:
+        meta = attrs(line)
+        rule_id = first(meta, 'id')
+        if not rule_id:
+            continue
+
+        denied = bool(re.match(r'^ModSecurity:\s*Access denied\b', line, re.I))
+        warning = bool(re.match(r'^ModSecurity:\s*Warning\b', line, re.I))
+        if denied:
+            event_type, action, disruptive = 'waf_block', 'Access denied', True
+        elif warning:
+            event_type, action, disruptive = 'waf_detection', 'Warning', False
+        else:
+            event_type, action, disruptive = 'waf_detection', 'Detection', False
+
+        tags = meta.get('tag', [])
+        rule_file = first(meta, 'file', '')
+        phase_match = re.search(r'\(phase\s+(\d+)\)', line, re.I)
+        phase = int(phase_match.group(1)) if phase_match else None
+        severity = first(meta, 'severity')
+        try:
+            severity = int(severity) if severity is not None else None
+        except ValueError:
+            pass
+
+        waf = {
+            'engine': 'ModSecurity',
+            'rule_id': rule_id,
+            'rule_message': sanitize(first(meta, 'msg', '')),
+            'rule_source': source_for(rule_file, tags),
+            'rule_file': rule_file or None,
+            'action': action,
+            'disruptive_action': disruptive,
+            'severity': severity,
+            'phase': phase,
+            'tags': tags,
+        }
+        if first(meta, 'ver'):
+            waf['rule_version'] = first(meta, 'ver')
+
+        event = {
+            'integration': 'brebes-waf',
+            'event_type': event_type,
+            'timestamp': timestamp,
+            'hostname': hostname,
+            'transaction_id': first(meta, 'unique_id', txid),
+            'client': {'ip': client_ip},
+            'request': {
+                'method': method,
+                'scheme': scheme,
+                'domain': host,
+                'uri': sanitize_uri(first(meta, 'uri', uri)),
+                'http_status': status,
+            },
+            'waf': waf,
+        }
+        if headers.get('user-agent'):
+            event['client']['user_agent'] = sanitize(headers['user-agent'])
+        if headers.get('referer'):
+            event['client']['referer'] = sanitize(headers['referer'])
+        if server_ip:
+            event['waf']['server_ip'] = server_ip
+
+        matched_var = re.search(r'against variable `([^`]+)`', line)
+        matched_data = first(meta, 'data')
+        if matched_var or matched_data:
+            context = {}
+            if matched_var:
+                context['matched_variable'] = matched_var.group(1)
+            if matched_data:
+                if matched_var and ('REQUEST_COOKIES' in matched_var.group(1).upper() or matched_var.group(1).upper().endswith(':COOKIE')):
+                    context['matched_data'] = '[REDACTED_COOKIE_MATCH]'
+                else:
+                    context['matched_data'] = sanitize(matched_data)
+            event['attack_context'] = context
+        events.append(event)
+    return events
+
+
+def load_config(path: Path) -> dict:
+    try:
+        config = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'[ERROR] Cannot read collector config {path}: {exc}')
+    roots = config.get('roots')
+    if not isinstance(roots, list) or not roots:
+        raise SystemExit('[ERROR] Collector config has no audit roots.')
+    return config
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', default='/etc/defenseops/modsecurity-collector.json')
+    args = ap.parse_args()
+    config = load_config(Path(args.config))
+
+    roots = [Path(item) for item in config['roots']]
+    output = Path(config.get('output', '/var/log/defenseops/modsecurity-events.json'))
+    state = Path(config.get('state', '/var/lib/defenseops/modsecurity-state.sqlite3'))
+    baseline = config.get('baseline_epoch')
+    try:
+        baseline = float(baseline) if baseline is not None else None
+    except (TypeError, ValueError):
+        baseline = None
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    hostname = socket.gethostname()
+    conn = sqlite3.connect(state)
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS processed '
+        '(txid TEXT NOT NULL, rule_id TEXT NOT NULL, '
+        'PRIMARY KEY(txid, rule_id))'
+    )
+    conn.commit()
+    added = 0
+    seen_paths: set[str] = set()
+
+    with output.open('a', encoding='utf-8') as out:
+        for root in roots:
+            candidates = (
+                [root] if root.is_file()
+                else sorted(p for p in root.rglob('*') if p.is_file())
+                if root.is_dir()
+                else []
+            )
+            if not candidates:
+                print(f'[WARN] Audit root not found or empty: {root}', file=sys.stderr)
+            for path in candidates:
+                try:
+                    resolved = str(path.resolve())
+                    if resolved in seen_paths:
+                        continue
+                    seen_paths.add(resolved)
+                    stat = path.stat()
+                    if baseline is not None and stat.st_mtime < baseline:
+                        continue
+                    if stat.st_size < 20:
+                        continue
+                    for event in parse_audit(path, hostname):
+                        txid = str(event.get('transaction_id', ''))
+                        rule_id = str(event['waf']['rule_id'])
+                        cur = conn.execute(
+                            'INSERT OR IGNORE INTO processed(txid, rule_id) VALUES (?, ?)',
+                            (txid, rule_id)
+                        )
+                        if cur.rowcount == 0:
+                            continue
+                        out.write(json.dumps(
+                            event, ensure_ascii=False, separators=(',', ':')
+                        ) + '\n')
+                        added += 1
+                except (OSError, UnicodeError, sqlite3.Error) as exc:
+                    print(f'[WARN] Cannot process {path}: {exc}', file=sys.stderr)
+        out.flush()
+        os.fsync(out.fileno())
+    conn.commit()
+    conn.close()
+    if added:
+        print(f'[INFO] Appended {added} ModSecurity event(s) to {output}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+
+PYCOLLECTOR
+  chown root:root "$parser_tmp"
+  chmod 0750 "$parser_tmp"
+  python3 - "$parser_tmp" <<'PYCHECK'
+import sys
+from pathlib import Path
+compile(Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")
+print("[INFO] ModSecurity collector Python syntax: OK")
+PYCHECK
+  mv -f "$parser_tmp" "$parser"
+
+  # Preserve the original baseline and SQLite state on installer re-runs.
+  python3 - "$config" "${MODSEC_PARSER_ROOTS[@]}" <<'PYCONFIG'
+import json
+import sys
+import time
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+roots = sorted(set(sys.argv[2:]))
+baseline = time.time()
+if config_path.is_file():
+    try:
+        old = json.loads(config_path.read_text(encoding="utf-8"))
+        baseline = float(old.get("baseline_epoch", baseline))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+data = {
+    "roots": roots,
+    "output": "/var/log/defenseops/modsecurity-events.json",
+    "state": "/var/lib/defenseops/modsecurity-state.sqlite3",
+    "baseline_epoch": baseline
+}
+tmp = config_path.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+tmp.replace(config_path)
+PYCONFIG
+  chown root:root "$config"
+  chmod 0640 "$config"
+
+  cat > /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$ <<'UNIT'
+[Unit]
+Description=DefenseOps ModSecurity Audit Collector
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+ExecStart=/usr/bin/python3 /usr/local/libexec/defenseops-modsecurity-collector.py --config /etc/defenseops/modsecurity-collector.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+UNIT
+  chown root:root /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$
+  chmod 0644 /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$
+  mv -f /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$ /etc/systemd/system/defenseops-modsecurity-collector.service
+
+  cat > /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$ <<'UNIT'
+[Unit]
+Description=Run DefenseOps ModSecurity Audit Collector periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=defenseops-modsecurity-collector.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+  chown root:root /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$
+  chmod 0644 /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$
+  mv -f /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$ /etc/systemd/system/defenseops-modsecurity-collector.timer
+
+  touch "${log_dir}/modsecurity-events.json"
+  if getent group wazuh >/dev/null 2>&1; then
+    chown root:wazuh "${log_dir}/modsecurity-events.json"
+  else
+    chown root:root "${log_dir}/modsecurity-events.json"
+  fi
+  chmod 0640 "${log_dir}/modsecurity-events.json"
+  log "ModSecurity collector staged: ${parser}"
+}
+
+activate_modsecurity_collector(){
+  (( MODSEC_COLLECTOR_ENABLED == 1 )) || return 0
+  if getent group wazuh >/dev/null 2>&1; then
+    chown root:wazuh /var/log/defenseops /var/log/defenseops/modsecurity-events.json
+    chmod 0750 /var/log/defenseops
+    chmod 0640 /var/log/defenseops/modsecurity-events.json
+  fi
+  systemctl daemon-reload
+  systemctl enable --now defenseops-modsecurity-collector.timer
+  systemctl is-active --quiet defenseops-modsecurity-collector.timer ||
+    die "DefenseOps ModSecurity collector timer failed to start."
+  log "DefenseOps ModSecurity collector timer is active (30-second interval)."
+}
+
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   log "Inspecting every active Nginx virtual host and validating JSON access logs..."
   discover_brebes_waf
@@ -706,6 +1190,12 @@ else
   log "Docker-PHP base profile selected."
   log "No global Docker container logs will be collected."
   log "Per-application monitoring will be registered later by create-php-app.sh."
+fi
+
+# Stage the parser only after local ModSecurity discovery has succeeded.
+# Timer activation is deferred until the Wazuh configuration has been validated.
+if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]] && (( MODSEC_COLLECTOR_ENABLED == 1 )); then
+  stage_modsecurity_collector
 fi
 
 # Time settings are opt-in. Do not overwrite chrony/timesyncd configuration.
@@ -912,24 +1402,16 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   {
     for path in "${!NGINX_ACCESS_LOGS[@]}"; do printf '%s\tjson\n' "$path"; done
     for path in "${!NGINX_ERROR_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
-    for path in "${!MODSEC_LOGS[@]}"; do printf '%s\tsyslog\n' "$path"; done
+    for path in "${!MODSEC_DEBUG_FILES[@]}"; do printf '%s\tsyslog\n' "$path"; done
+    if (( MODSEC_COLLECTOR_ENABLED == 1 )); then
+      printf '%s\tjson\n' "$MODSEC_JSON_LOG"
+    fi
   } | sort -u > "$PATHS_FILE"
 
-  for path in "${!MODSEC_LOGS[@]}"; do
-    if ! awk -F '\t' -v wanted="$path" '$1 == wanted { found=1 } END { exit(found ? 0 : 1) }' "$PATHS_FILE"; then
-      die "ModSecurity log was discovered but not added to the Agent collection manifest: ${path}"
-    fi
-  done
-  if ((${#MODSEC_LOGS[@]} > 0)); then
-    log "ModSecurity log collection paths verified:"
-    for path in "${!MODSEC_LOGS[@]}"; do
-      printf '  [MODSEC] %s\n' "$path"
-    done
+  if (( MODSEC_COLLECTOR_ENABLED == 1 )); then
+    log "ModSecurity JSON event collection configured: ${MODSEC_JSON_LOG}"
   else
-    warn "No SecAuditLog/SecDebugLog file path was discovered from active Nginx ModSecurity rules files."
-    if ((${#MODSEC_STORAGE_DIRS[@]} > 0)); then
-      warn "SecAuditLogStorageDir was found, but its directory is not a valid Wazuh localfile path; inspect the Concurrent audit layout before adding transaction-file collection."
-    fi
+    warn "ModSecurity audit collector is not enabled because no usable audit source was discovered."
   fi
 fi
 
@@ -1163,6 +1645,10 @@ else
   die "Wazuh Agent did not become active. Check /var/ossec/logs/ossec.log."
 fi
 
+if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]] && (( MODSEC_COLLECTOR_ENABLED == 1 )); then
+  activate_modsecurity_collector
+fi
+
 if (( RESET_APPLIED == 1 )); then
   RESET_COMMITTED=1
   log "Reset/re-enrollment completed. Previous ossec.conf backup: ${RESET_CONF_BACKUP}"
@@ -1300,10 +1786,19 @@ Brebes-WAF:
   log_format verified as a JSON object using escape=json. Explicit access_log off
   directives are skipped. Non-JSON or unsafe vhost access logs abort installation
   before package installation, enrollment, or Agent configuration changes.
-  Nginx error logs and discovered SecAuditLog/SecDebugLog file paths are
-  collected as syslog. SecAuditLogStorageDir is recognized as a directory,
-  never incorrectly registered as a file. Concurrent transaction-file
-  collection is not guessed from the directory alone.
+  SecAuditLogType, SecAuditLog, SecAuditLogStorageDir, and SecDebugLog are
+  discovered separately. Concurrent mode reads completed transaction files
+  from SecAuditLogStorageDir; Serial mode reads SecAuditLog. SecAuditLog index
+  files are never mistaken for transaction files. SecDebugLog remains collected
+  separately as plain-text syslog and is not treated as the audit-event source. A parser writes normalized JSONL
+  events, which Wazuh collects with log_format=json. The endpoint installer
+  installs the parser and a systemd timer (30-second interval) automatically;
+  no manual Python execution is required.
+  The installer embeds defenseops-modsecurity-collector.py and installs it at
+  /usr/local/libexec. Its systemd timer scans audit roots every 30 seconds,
+  emits one JSON event per triggered rule, and uses SQLite to avoid duplicates.
+  Initial baseline prevents replaying pre-install audit transactions. Wazuh
+  reads only /var/log/defenseops/modsecurity-events.json as JSON.
   Nginx and ModSecurity configurations are never modified.
   The installer backs up /var/ossec/etc/ossec.conf, stages the updated file,
   validates it with wazuh-agentd -t, and restores the backup if validation fails.
@@ -1358,4 +1853,5 @@ printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
 log "Profiles: brebes-waf, docker-php. Existing Agents are prompted: reset/re-enroll or preserve and repair missing settings."
+log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
