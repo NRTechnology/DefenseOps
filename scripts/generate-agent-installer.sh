@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.6.0
+# Version     : 1.8.0
 # Release     : 2026-11-09
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 SCRIPT_RELEASE="2026-11-09"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -151,7 +151,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.7.0"
+INSTALLER_VERSION="1.8.0"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -776,12 +776,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -978,7 +981,7 @@ def parse_audit(path: Path, hostname: str) -> list[dict]:
         if server_ip:
             event['waf']['server_ip'] = server_ip
 
-        matched_var = re.search(r'against variable `([^`]+)`', line)
+        matched_var = re.search(r"against variable [`']([^`']+)[`']", line, re.I)
         matched_data = first(meta, 'data')
         if matched_var or matched_data:
             context = {}
@@ -1005,6 +1008,116 @@ def load_config(path: Path) -> dict:
     return config
 
 
+def ensure_state_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS processed '
+        '(txid TEXT NOT NULL, rule_id TEXT NOT NULL, '
+        'PRIMARY KEY(txid, rule_id))'
+    )
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(processed)')}
+    if 'processed_at' not in columns:
+        # Existing v1.7.0 rows are retained for a full 180 days from migration.
+        conn.execute('ALTER TABLE processed ADD COLUMN processed_at REAL')
+        conn.execute(
+            'UPDATE processed SET processed_at = ? WHERE processed_at IS NULL',
+            (time.time(),)
+        )
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_processed_at ON processed(processed_at)'
+    )
+    conn.commit()
+
+
+def prune_state(conn: sqlite3.Connection, retention_days: int) -> int:
+    cutoff = time.time() - retention_days * 86400
+    cur = conn.execute(
+        'DELETE FROM processed WHERE processed_at IS NOT NULL AND processed_at < ?',
+        (cutoff,)
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def rotate_output(output: Path) -> Path | None:
+    if not output.exists() or output.stat().st_size == 0:
+        return None
+    st = output.stat()
+    stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    sequence = 0
+    while True:
+        suffix = f'.{stamp}.{sequence:03d}.gz'
+        archive = output.with_name(output.name + suffix)
+        if not archive.exists():
+            break
+        sequence += 1
+    staged = output.with_name('.' + output.name + '.rotating.' + str(os.getpid()))
+    os.replace(output, staged)
+    try:
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, st.st_mode & 0o777)
+        try:
+            os.fchown(fd, st.st_uid, st.st_gid)
+            os.fchmod(fd, st.st_mode & 0o777)
+        finally:
+            os.close(fd)
+    except Exception:
+        if output.exists() and output.stat().st_size == 0:
+            output.unlink()
+        os.replace(staged, output)
+        raise
+    try:
+        with staged.open('rb') as source, gzip.open(archive, 'wb', compresslevel=6) as target:
+            shutil.copyfileobj(source, target)
+        os.chown(archive, st.st_uid, st.st_gid)
+        os.chmod(archive, st.st_mode & 0o777)
+        staged.unlink()
+    except Exception:
+        # Keep the uncompressed staged file if compression fails; never discard data.
+        print(f'[WARN] Rotation compression failed; retained {staged}: {sys.exc_info()[1]}', file=sys.stderr)
+        return staged
+    return archive
+
+
+def prune_archives(output: Path, retention_days: int) -> int:
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    pattern = output.name + '.*.gz'
+    for archive in output.parent.glob(pattern):
+        try:
+            if archive.is_file() and archive.stat().st_mtime < cutoff:
+                archive.unlink()
+                removed += 1
+        except OSError as exc:
+            print(f'[WARN] Cannot remove expired archive {archive}: {exc}', file=sys.stderr)
+    return removed
+
+
+def append_events(output: Path, lines: list[str], max_bytes: int) -> int:
+    written = 0
+    current_size = output.stat().st_size if output.exists() else 0
+    out = output.open('a', encoding='utf-8')
+    try:
+        for line in lines:
+            encoded_size = len(line.encode('utf-8'))
+            if max_bytes > 0 and current_size > 0 and current_size + encoded_size > max_bytes:
+                out.flush()
+                os.fsync(out.fileno())
+                out.close()
+                rotated = rotate_output(output)
+                if rotated:
+                    print(f'[INFO] Rotated ModSecurity output to {rotated}', file=sys.stderr)
+                current_size = 0
+                out = output.open('a', encoding='utf-8')
+            out.write(line)
+            current_size += encoded_size
+            written += 1
+        out.flush()
+        os.fsync(out.fileno())
+    finally:
+        if not out.closed:
+            out.close()
+    return written
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='/etc/defenseops/modsecurity-collector.json')
@@ -1020,61 +1133,82 @@ def main() -> int:
     except (TypeError, ValueError):
         baseline = None
 
+    max_output_bytes = int(config.get('max_output_bytes', 250000000))
+    archive_retention_days = int(config.get('archive_retention_days', 90))
+    state_retention_days = int(config.get('state_retention_days', 180))
+    source_max_age_days = int(config.get('source_max_age_days', 180))
+    if min(archive_retention_days, state_retention_days, source_max_age_days) < 1:
+        raise SystemExit('[ERROR] Retention periods must be positive integers.')
+    if max_output_bytes < 1024 * 1024:
+        raise SystemExit('[ERROR] max_output_bytes must be at least 1 MiB.')
+
     output.parent.mkdir(parents=True, exist_ok=True)
     state.parent.mkdir(parents=True, exist_ok=True)
     hostname = socket.gethostname()
     conn = sqlite3.connect(state)
-    conn.execute(
-        'CREATE TABLE IF NOT EXISTS processed '
-        '(txid TEXT NOT NULL, rule_id TEXT NOT NULL, '
-        'PRIMARY KEY(txid, rule_id))'
-    )
-    conn.commit()
-    added = 0
+    ensure_state_schema(conn)
+    pruned_state = prune_state(conn, state_retention_days)
+    if pruned_state:
+        print(f'[INFO] Pruned {pruned_state} SQLite deduplication record(s) older than {state_retention_days} days')
+
+    now = time.time()
+    source_cutoff = now - source_max_age_days * 86400
+    added_lines: list[str] = []
     seen_paths: set[str] = set()
 
-    with output.open('a', encoding='utf-8') as out:
-        for root in roots:
-            candidates = (
-                [root] if root.is_file()
-                else sorted(p for p in root.rglob('*') if p.is_file())
-                if root.is_dir()
-                else []
-            )
-            if not candidates:
-                print(f'[WARN] Audit root not found or empty: {root}', file=sys.stderr)
-            for path in candidates:
-                try:
-                    resolved = str(path.resolve())
-                    if resolved in seen_paths:
+    for root in roots:
+        candidates = (
+            [root] if root.is_file()
+            else sorted(p for p in root.rglob('*') if p.is_file())
+            if root.is_dir()
+            else []
+        )
+        if not candidates:
+            print(f'[WARN] Audit root not found or empty: {root}', file=sys.stderr)
+        for path in candidates:
+            try:
+                resolved = str(path.resolve())
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                stat = path.stat()
+                if baseline is not None and stat.st_mtime < baseline:
+                    continue
+                # Align source-file scan horizon with SQLite dedup retention so
+                # pruning old keys cannot replay old retained audit transactions.
+                if stat.st_mtime < source_cutoff:
+                    continue
+                if stat.st_size < 20:
+                    continue
+                for event in parse_audit(path, hostname):
+                    txid = str(event.get('transaction_id', ''))
+                    rule_id = str(event['waf']['rule_id'])
+                    cur = conn.execute(
+                        'INSERT OR IGNORE INTO processed(txid, rule_id, processed_at) VALUES (?, ?, ?)',
+                        (txid, rule_id, time.time())
+                    )
+                    if cur.rowcount == 0:
                         continue
-                    seen_paths.add(resolved)
-                    stat = path.stat()
-                    if baseline is not None and stat.st_mtime < baseline:
-                        continue
-                    if stat.st_size < 20:
-                        continue
-                    for event in parse_audit(path, hostname):
-                        txid = str(event.get('transaction_id', ''))
-                        rule_id = str(event['waf']['rule_id'])
-                        cur = conn.execute(
-                            'INSERT OR IGNORE INTO processed(txid, rule_id) VALUES (?, ?)',
-                            (txid, rule_id)
-                        )
-                        if cur.rowcount == 0:
-                            continue
-                        out.write(json.dumps(
-                            event, ensure_ascii=False, separators=(',', ':')
-                        ) + '\n')
-                        added += 1
-                except (OSError, UnicodeError, sqlite3.Error) as exc:
-                    print(f'[WARN] Cannot process {path}: {exc}', file=sys.stderr)
-        out.flush()
-        os.fsync(out.fileno())
-    conn.commit()
+                    added_lines.append(json.dumps(
+                        event, ensure_ascii=False, separators=(',', ':')
+                    ) + '\n')
+            except (OSError, UnicodeError, sqlite3.Error) as exc:
+                print(f'[WARN] Cannot process {path}: {exc}', file=sys.stderr)
+
+    if added_lines:
+        written = append_events(output, added_lines, max_output_bytes)
+        conn.commit()
+        print(f'[INFO] Appended {written} ModSecurity event(s) to {output}')
+    else:
+        # Ensure the watched file exists even when there are no new events.
+        output.touch(exist_ok=True)
+        conn.commit()
     conn.close()
-    if added:
-        print(f'[INFO] Appended {added} ModSecurity event(s) to {output}')
+
+    removed_archives = prune_archives(output, archive_retention_days)
+    if removed_archives:
+        print(f'[INFO] Removed {removed_archives} expired ModSecurity archive(s) older than {archive_retention_days} days')
+    return 0
     return 0
 
 
@@ -1112,7 +1246,11 @@ data = {
     "roots": roots,
     "output": "/var/log/defenseops/modsecurity-events.json",
     "state": "/var/lib/defenseops/modsecurity-state.sqlite3",
-    "baseline_epoch": baseline
+    "baseline_epoch": baseline,
+    "max_output_bytes": 250000000,
+    "archive_retention_days": 90,
+    "state_retention_days": 180,
+    "source_max_age_days": 180
 }
 tmp = config_path.with_suffix(".json.tmp")
 tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -1798,7 +1936,9 @@ Brebes-WAF:
   /usr/local/libexec. Its systemd timer scans audit roots every 30 seconds,
   emits one JSON event per triggered rule, and uses SQLite to avoid duplicates.
   Initial baseline prevents replaying pre-install audit transactions. Wazuh
-  reads only /var/log/defenseops/modsecurity-events.json as JSON.
+  reads only /var/log/defenseops/modsecurity-events.json as JSON;
+  rotates output at 250 MB, retains compressed archives for 90 days,
+  and prunes SQLite deduplication state older than 180 days.
   Nginx and ModSecurity configurations are never modified.
   The installer backs up /var/ossec/etc/ossec.conf, stages the updated file,
   validates it with wazuh-agentd -t, and restores the backup if validation fails.
