@@ -1651,6 +1651,43 @@ print(v.group(1) if v else "missing")
     ok "Enrollment password aktif; use_password=yes persisten, authd.pass tersimpan aman, dan TCP 1515 listening."
 }
 
+ensure_manager_agent_groups() {
+    log "Memastikan group agent DefenseOps tersedia..."
+
+    local container_id groups_output group
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk pembuatan agent groups."
+
+    docker exec "$container_id" test -x /var/ossec/bin/agent_groups \
+        || die "Tool /var/ossec/bin/agent_groups tidak ditemukan di container Manager."
+
+    groups_output="$(docker exec "$container_id" /var/ossec/bin/agent_groups -l 2>&1)" \
+        || die "Gagal membaca daftar agent groups dari Wazuh Manager."
+
+    for group in Brebes-WAF docker-php; do
+        if printf '%s\n' "$groups_output" |
+            awk -v wanted="$group" '$1 == wanted && $2 ~ /^\([0-9]+\)$/ { found=1 } END { exit !found }'; then
+            ok "Agent group '${group}' sudah tersedia; dipertahankan."
+            continue
+        fi
+
+        log "Membuat agent group '${group}'..."
+        docker exec "$container_id" /var/ossec/bin/agent_groups -a -g "$group" -q \
+            || die "Gagal membuat agent group '${group}'."
+
+        groups_output="$(docker exec "$container_id" /var/ossec/bin/agent_groups -l 2>&1)" \
+            || die "Gagal memverifikasi agent group '${group}'."
+        printf '%s\n' "$groups_output" |
+            awk -v wanted="$group" '$1 == wanted && $2 ~ /^\([0-9]+\)$/ { found=1 } END { exit !found }' \
+            || die "Agent group '${group}' belum terdaftar setelah pembuatan."
+        ok "Agent group '${group}' berhasil dibuat."
+    done
+
+    log "Daftar agent groups yang ditargetkan:"
+    docker exec "$container_id" /var/ossec/bin/agent_groups -l |
+        awk '$1 == "Brebes-WAF" || $1 == "docker-php"'
+}
+
 deploy_wazuh() {
     log "Menyiapkan deployment Wazuh ${WAZUH_VERSION}..."
     create_docker_network
@@ -1675,6 +1712,7 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Manager..."
     compose_up manager
     ensure_manager_agent_enrollment
+    ensure_manager_agent_groups
     configure_effective_manager_archives
     wait_for_manager
     configure_manager_api_tls
@@ -1910,6 +1948,7 @@ main() {
         log "Manager local compressed archives cleanup (14d)."
         log "NTP/chrony -> optional timezone Asia/Jakarta -> enrollment password use_password=yes in persistent wazuh_etc volume."
         log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
+        log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
         exit 0
     fi
 
