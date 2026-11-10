@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.3
-# Release     : 2026-11-09
+# Version     : 1.8.4
+# Release     : 2026-11-10
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.3"
+SCRIPT_VERSION="1.8.4"
 SCRIPT_RELEASE="2026-11-10"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.3"
+INSTALLER_VERSION="1.8.4"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -203,7 +203,7 @@ if (( AGENT_PACKAGE_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
   # A literal template token is not a usable Manager address. Do not let it
   # override the trusted address embedded in this generated bundle.
   case "${ACTIVE_MANAGER,,}" in
-    ""|manager_ip|<manager_ip>|changeme|<manager>) ACTIVE_MANAGER="" ;;
+    ""|manager_ip|"<manager_ip>"|changeme|"<manager>") ACTIVE_MANAGER="" ;;
   esac
 fi
 
@@ -223,7 +223,7 @@ if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
   MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
 fi
 case "${MANAGER,,}" in
-  ""|manager_ip|<manager_ip>|changeme|<manager>)
+  ""|manager_ip|"<manager_ip>"|changeme|"<manager>")
     die "Manager address is empty or a template placeholder. Check the generated bundle or use --manager IP/FQDN." ;;
 esac
 [[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address: $MANAGER"
