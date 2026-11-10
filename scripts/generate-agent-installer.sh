@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.2
+# Version     : 1.8.3
 # Release     : 2026-11-09
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.2"
+SCRIPT_VERSION="1.8.3"
 SCRIPT_RELEASE="2026-11-10"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.2"
+INSTALLER_VERSION="1.8.3"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -200,6 +200,11 @@ ACTIVE_AGENT_CONF="/var/ossec/etc/ossec.conf"
 ACTIVE_MANAGER=""
 if (( AGENT_PACKAGE_INSTALLED == 1 )) && [[ -s "$ACTIVE_AGENT_CONF" ]]; then
   ACTIVE_MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$ACTIVE_AGENT_CONF" | head -n1)"
+  # A literal template token is not a usable Manager address. Do not let it
+  # override the trusted address embedded in this generated bundle.
+  case "${ACTIVE_MANAGER,,}" in
+    ""|manager_ip|<manager_ip>|changeme|<manager>) ACTIVE_MANAGER="" ;;
+  esac
 fi
 
 AGENT_ENROLLED=0
@@ -217,7 +222,11 @@ fi
 if [[ -z "$MANAGER" && -f "$CONFIG_FILE" ]]; then
   MANAGER="$(sed -n 's:.*<address>\([^<]*\)</address>.*:\1:p' "$CONFIG_FILE" | head -n1)"
 fi
-[[ -n "$MANAGER" ]] || die "Manager address unavailable. Use --manager or provide ossec.conf."
+case "${MANAGER,,}" in
+  ""|manager_ip|<manager_ip>|changeme|<manager>)
+    die "Manager address is empty or a template placeholder. Check the generated bundle or use --manager IP/FQDN." ;;
+esac
+[[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address: $MANAGER"
 
 if (( AGENT_PACKAGE_INSTALLED == 1 )); then
   echo
@@ -1584,16 +1593,64 @@ trap cleanup_files EXIT
 # staging file. The original remains untouched until all pre-activation checks pass.
 cp -a -- "$AGENT_CONF" "$TMP_AGENT_CONF"
 
-python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" <<'PYMERGE'
+python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" "$MANAGER" "$RESET_EXISTING" <<'PYMERGE'
 import html
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-source, destination, profile, paths_file = sys.argv[1:5]
+source, destination, profile, paths_file, expected_manager, reset_existing = sys.argv[1:7]
 original = Path(source).read_text(encoding="utf-8")
 text = original
+
+# On the preserve path, validate the ACTIVE Agent's client/server address.
+# Repair only a known template placeholder, using the Manager address from
+# this generated bundle. A different but syntactically valid Manager is never
+# silently replaced: abort and require an explicit reset/migration decision.
+def manager_addresses(xml_text):
+    root = ET.fromstring("<defenseops_validation_root>" +
+                         re.sub(r"^\s*<\?xml[^?]*\?>", "", xml_text, count=1) +
+                         "</defenseops_validation_root>")
+    found = []
+    for client in root.iter("client"):
+        for server in client.findall("server"):
+            for address in server.findall("address"):
+                found.append((address.text or "").strip())
+    return found
+
+if reset_existing != "1":
+    try:
+        current_addresses = manager_addresses(text)
+    except ET.ParseError as exc:
+        raise SystemExit(f"Existing ossec.conf XML is invalid; refusing preserve-mode update: {exc}")
+    if len(current_addresses) != 1:
+        raise SystemExit(
+            "Existing ossec.conf must contain exactly one <client><server><address>; "
+            f"found {len(current_addresses)}. No configuration was changed."
+        )
+    current_manager = current_addresses[0]
+    placeholder_values = {"", "manager_ip", "<manager_ip>", "changeme", "<manager>"}
+    if current_manager.lower() in placeholder_values:
+        # Replace only the address value inside the client/server section.
+        pattern = re.compile(
+            r"(<client\b[^>]*>.*?<server\b[^>]*>.*?<address\b[^>]*>)(.*?)(</address\s*>.*?</server\s*>.*?</client\s*>)",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1:
+            raise SystemExit("Could not safely locate the single client/server address for placeholder repair.")
+        match = matches[0]
+        text = text[:match.start()] + match.group(1) + html.escape(expected_manager) + match.group(3) + text[match.end():]
+        print(f"[INFO] Repaired placeholder Manager address in active ossec.conf: {expected_manager}")
+    elif current_manager != expected_manager:
+        raise SystemExit(
+            f"Existing Agent Manager '{current_manager}' differs from generated bundle Manager "
+            f"'{expected_manager}'. Refusing to overwrite an enrolled Agent's Manager address. "
+            "Choose reset/re-enroll only if migration is intentional."
+        )
+    else:
+        print(f"[INFO] Existing Agent Manager address verified: {current_manager}")
 
 # Wazuh supports multiple top-level <ossec_config> sections. Wrap them only
 # for validation; do not serialize through ElementTree, which would rewrite
@@ -1863,8 +1920,10 @@ Endpoint installation / profile update:
   Select Brebes-WAF or Docker-PHP when prompted.
 
   If Wazuh Agent is absent: installs and enrolls the Agent.
-  If Wazuh Agent is already installed: preserves package, Manager, client
-  identity, and unrelated configuration; merges only missing profile settings.
+  If Wazuh Agent is already installed and reset is declined: validates the
+  active Manager address against this bundle, repairs only a known placeholder,
+  preserves package/client identity/unrelated configuration, and merges only
+  missing profile settings. A different valid Manager address causes a safe abort.
   Existing installations are not re-enrolled or upgraded by package manager.
 
 Brebes-WAF:
