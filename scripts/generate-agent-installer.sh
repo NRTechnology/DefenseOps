@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.0
+# Version     : 1.8.1
 # Release     : 2026-11-09
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.0"
-SCRIPT_RELEASE="2026-11-09"
+SCRIPT_VERSION="1.8.1"
+SCRIPT_RELEASE="2026-11-10"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -39,12 +39,11 @@ Options:
   -h, --help               Show help
 
 The generated endpoint installer asks whether the endpoint is:
-  1. Brebes-WAF
-  2. Docker-PHP
+  1. Brebes-WAF -> Wazuh group Brebes-WAF
+  2. Docker-PHP -> Wazuh group docker-php
 
 Brebes-WAF Nginx and ModSecurity discovery runs on the endpoint itself.
-Docker-PHP application-specific monitoring will be integrated later with
-create-php-app.sh / delete-php-app.sh.
+No Docker CLI or Docker Engine is required by this generator.
 Enrollment secrets are never embedded in the bundle.
 EOF
 }
@@ -96,20 +95,7 @@ case "${confirm,,}" in
   n|no) die "Cancelled. Re-run with --manager IP/FQDN." ;;
 esac
 
-# Validate enrollment prerequisites only when the expected Manager container is
-# present locally. Do not inspect, read, or copy the enrollment password.
-MANAGER_CONTAINER="${WAZUH_MANAGER_CONTAINER:-defenseops-manager-wazuh.manager-1}"
-if command -v docker >/dev/null 2>&1 && docker inspect "$MANAGER_CONTAINER" >/dev/null 2>&1; then
-  AUTHD_PASS="$(docker exec "$MANAGER_CONTAINER" sh -c \
-    'test -s /var/ossec/etc/authd.pass && echo yes || echo no' 2>/dev/null || echo no)"
-  USE_PASSWORD="$(docker exec "$MANAGER_CONTAINER" sh -c \
-    "grep -A12 '<auth>' /var/ossec/etc/ossec.conf | grep -m1 '<use_password>' | sed -E 's/.*>([^<]+).*/\\1/'" \
-    2>/dev/null || true)"
-  [[ "$AUTHD_PASS" == yes ]] || die "Manager authd.pass not found/empty in ${MANAGER_CONTAINER}."
-  [[ "$USE_PASSWORD" == yes ]] || die "Manager auth config does not show use_password=yes."
-else
-  warn "Manager container '${MANAGER_CONTAINER}' not detected; skipping local authd prerequisite check."
-fi
+# Manager enrollment prerequisites are checked by the endpoint enrollment itself.
 
 mkdir -p "$OUT_DIR"
 chmod 0750 "$OUT_DIR"
@@ -143,15 +129,15 @@ cat > "$TMP_CONF" <<EOF
 EOF
 install -o root -g root -m 0640 "$TMP_CONF" "${OUT_DIR}/ossec.conf"
 
-# Endpoint-side installer. First-time installation enrolls a new Agent.
-# Existing installations are updated in place: active config is parsed and
-# only missing profile settings are merged; unrelated content is preserved.
+# Endpoint-side installer. Package installation and enrollment are separate.
+# New and pre-installed unenrolled Agents use explicit agent-auth enrollment.
+# Existing enrolled identities are preserved; only missing profile settings merge.
 cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.0"
+INSTALLER_VERSION="1.8.1"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -173,7 +159,6 @@ Usage:
 Options:
   -m, --manager IP/FQDN    Wazuh Manager address (default: from ossec.conf)
   -n, --name NAME          Agent name (default: hostname)
-  -g, --group GROUP        Existing Wazuh agent group (optional)
   -c, --config FILE        Generated ossec.conf (default: ./ossec.conf)
   -h, --help               Show help
 
@@ -188,7 +173,6 @@ while (($#)); do
   case "$1" in
     -m|--manager) [[ $# -ge 2 ]] || die "Missing Manager address."; MANAGER="$2"; shift 2 ;;
     -n|--name) [[ $# -ge 2 ]] || die "Missing agent name."; AGENT_NAME="$2"; shift 2 ;;
-    -g|--group) [[ $# -ge 2 ]] || die "Missing agent group."; AGENT_GROUP="$2"; shift 2 ;;
     -c|--config) [[ $# -ge 2 ]] || die "Missing config file."; CONFIG_FILE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)." ;;
@@ -278,16 +262,26 @@ echo "  [1] Brebes-WAF (Nginx + ModSecurity)"
 echo "  [2] Docker-PHP (only Docker-PHP-managed applications)"
 read -r -p "Select profile [1/2]: " profile_answer
 case "$profile_answer" in
-  1) ENDPOINT_PROFILE="brebes-waf" ;;
-  2) ENDPOINT_PROFILE="docker-php" ;;
-  *) die "Invalid profile selection. Choose 1 or 2." ;;
+  1)
+    ENDPOINT_PROFILE="brebes-waf"
+    AGENT_GROUP="Brebes-WAF"
+    ;;
+  2)
+    ENDPOINT_PROFILE="docker-php"
+    AGENT_GROUP="docker-php"
+    ;;
+  *)
+    die "Invalid profile selection. Choose 1 or 2."
+    ;;
 esac
 log "Selected endpoint profile: ${ENDPOINT_PROFILE}"
+log "Wazuh agent group: ${AGENT_GROUP}"
 log "DefenseOps installer version: ${INSTALLER_VERSION}"
 
 if (( AGENT_PACKAGE_INSTALLED == 1 && AGENT_ENROLLED == 1 )); then
   log "Enrolled Wazuh Agent detected: profile/configuration update only."
-  log "Package, enrollment identity, and Manager address will be preserved."
+  log "Package, enrollment identity, Manager address, and current group membership will be preserved."
+  log "Selected target group '${AGENT_GROUP}' applies on first enrollment only; existing group membership is unchanged."
 elif (( AGENT_PACKAGE_INSTALLED == 1 && AGENT_ENROLLED == 0 )); then
   log "Wazuh Agent package is installed but not enrolled: enrollment will be completed without reinstalling the package."
 else
@@ -1325,9 +1319,7 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   discover_brebes_waf
   log "Brebes-WAF JSON validation passed."
 else
-  log "Docker-PHP base profile selected."
-  log "No global Docker container logs will be collected."
-  log "Per-application monitoring will be registered later by create-php-app.sh."
+  log "Docker-PHP endpoint profile selected."
 fi
 
 # Stage the parser only after local ModSecurity discovery has succeeded.
@@ -1430,16 +1422,7 @@ if (( AGENT_ENROLLED == 0 )); then
   [[ -n "$REG_PASSWORD" ]] || die "Enrollment password cannot be empty."
 
   if (( AGENT_PACKAGE_INSTALLED == 0 )); then
-    # Package post-install enrollment uses the standard Wazuh environment.
-    export WAZUH_MANAGER="$MANAGER"
-    export WAZUH_REGISTRATION_SERVER="$MANAGER"
-    export WAZUH_MANAGER_PORT="$MANAGER_PORT"
-    export WAZUH_REGISTRATION_PORT="$REG_PORT"
-    export WAZUH_PROTOCOL="$PROTOCOL"
-    export WAZUH_REGISTRATION_PASSWORD="$REG_PASSWORD"
-    export WAZUH_AGENT_NAME="$AGENT_NAME"
-    [[ -n "$AGENT_GROUP" ]] && export WAZUH_AGENT_GROUP="$AGENT_GROUP" || true
-
+    # Install package only. Enrollment is performed explicitly below.
     [[ -r /etc/os-release ]] || die "Cannot identify Linux distribution."
     . /etc/os-release
 
@@ -1452,8 +1435,8 @@ if (( AGENT_ENROLLED == 0 )); then
         curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
           gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
         chmod 0644 /usr/share/keyrings/wazuh.gpg
-        printf '%s\n' \
-          'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
+        printf '%s\\n' \\
+          'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \\
           > /etc/apt/sources.list.d/wazuh.list
         apt-get update
         apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
@@ -1482,26 +1465,39 @@ EOF
         ;;
     esac
   else
-    # Package exists but client.keys is absent/invalid: enroll in place.
-    # Do not reinstall the package or replace an existing Agent identity.
-    log "Enrolling the already-installed Wazuh Agent without reinstalling its package."
-    [[ -x /var/ossec/bin/agent-auth ]] ||
-      die "agent-auth binary not found; cannot enroll the installed Agent."
-    # agent-auth reads the password from /var/ossec/etc/authd.pass by default.
-    # Use a temporary root-only file rather than -P, which exposes the secret
-    # in the process argument list. Refuse to overwrite a pre-existing file.
-    [[ ! -e /var/ossec/etc/authd.pass ]] ||
-      die "/var/ossec/etc/authd.pass already exists; refusing to overwrite an existing credential file."
-    ( umask 077; printf '%s' "$REG_PASSWORD" > /var/ossec/etc/authd.pass )
-    chmod 0600 /var/ossec/etc/authd.pass
-    TEMP_AUTHD_PASS=1
-    auth_args=(-m "$MANAGER" -p "$REG_PORT" -A "$AGENT_NAME")
-    [[ -n "$AGENT_GROUP" ]] && auth_args+=(-G "$AGENT_GROUP")
-    /var/ossec/bin/agent-auth "${auth_args[@]}" ||
-      die "agent-auth failed. Check Manager connectivity, enrollment password, and authd configuration."
-    rm -f /var/ossec/etc/authd.pass
-    TEMP_AUTHD_PASS=0
+    log "Wazuh Agent package already installed; package will not be reinstalled."
   fi
+
+  [[ -x /var/ossec/bin/agent-auth ]] ||
+    die "agent-auth binary not found; cannot enroll the Agent."
+
+  # Preserve the package-created empty client.keys placeholder. Never overwrite
+  # a non-empty invalid identity file.
+  if [[ -e /var/ossec/etc/client.keys ]]; then
+    if [[ -s /var/ossec/etc/client.keys ]]; then
+      die "client.keys is non-empty but has no valid enrollment entry; refusing to overwrite it."
+    fi
+    EMPTY_KEYS_BACKUP="/var/ossec/etc/client.keys.empty.$(date +%Y%m%d-%H%M%S).$$"
+    mv -- /var/ossec/etc/client.keys "$EMPTY_KEYS_BACKUP"
+    log "Preserved empty client.keys placeholder: ${EMPTY_KEYS_BACKUP}"
+  fi
+
+  if systemctl is-active --quiet wazuh-agent; then
+    systemctl stop wazuh-agent
+  fi
+
+  # agent-auth accepts the authorization password through -P. This argument is
+  # short-lived; no credential file is created and no password enters the bundle.
+  auth_args=(-m "$MANAGER" -p "$REG_PORT" -A "$AGENT_NAME" -P "$REG_PASSWORD" -G "$AGENT_GROUP")
+  /var/ossec/bin/agent-auth "${auth_args[@]}" ||
+    die "agent-auth failed. Check Manager connectivity, enrollment password, and authd configuration."
+
+  [[ -s /var/ossec/etc/client.keys ]] ||
+    die "Enrollment did not create /var/ossec/etc/client.keys; refusing to continue."
+  if ! awk 'NF >= 3 { found=1 } END { exit(found ? 0 : 1) }' /var/ossec/etc/client.keys; then
+    die "client.keys exists but contains no valid enrollment entry; refusing to continue."
+  fi
+  AGENT_ENROLLED=1
 
   unset WAZUH_REGISTRATION_PASSWORD 2>/dev/null || true
   [[ -s /var/ossec/etc/client.keys ]] ||
@@ -1797,16 +1793,14 @@ log "Installed Wazuh Agent version: $(/var/ossec/bin/wazuh-agentd -V 2>&1 | head
 log "Endpoint profile: ${ENDPOINT_PROFILE}"
 if (( AGENT_WAS_ENROLLED == 1 )); then
   log "Manager and enrolled Agent identity: preserved (no re-enrollment)."
+  log "Existing Manager-side group membership was not changed."
 else
   log "Manager: ${MANAGER}:${MANAGER_PORT}/TCP; enrollment: ${MANAGER}:${REG_PORT}/TCP"
   log "Agent name: ${AGENT_NAME}"
+  log "Assigned Wazuh group during enrollment: ${AGENT_GROUP}"
 fi
 log "Verify this endpoint appears as Active in the DefenseOps Dashboard."
 
-if [[ "$ENDPOINT_PROFILE" == "docker-php" ]]; then
-  log "Docker-PHP application monitoring is not yet registered."
-  log "It will be integrated into create-php-app.sh / delete-php-app.sh."
-fi
 log "Verify this endpoint appears as Active in the DefenseOps Dashboard."
 INSTALLER
 
@@ -1845,51 +1839,9 @@ cat > "${OUT_DIR}/profiles/docker-php/agent.conf" <<'PROFILE_DOCKERPHP'
 PROFILE_DOCKERPHP
 chmod 0640 "${OUT_DIR}/profiles/docker-php/agent.conf"
 
-# Publish only the two focused groups; stage and validate before replacement.
-cat > "${OUT_DIR}/deploy-agent-profiles.sh" <<'DEPLOY'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-CONTAINER="${WAZUH_MANAGER_CONTAINER:-defenseops-manager-wazuh.manager-1}"
-BUNDLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-GROUPS=(brebes-waf docker-php)
-die(){ echo "[ERROR] $*" >&2; exit 1; }
-
-[[ $EUID -eq 0 ]] || die "Run on DefenseOps host as root."
-command -v docker >/dev/null 2>&1 || die "Docker CLI required."
-docker inspect "$CONTAINER" >/dev/null 2>&1 || die "Manager container not found: $CONTAINER"
-docker exec "$CONTAINER" test -x /var/ossec/bin/verify-agent-conf ||
-  die "verify-agent-conf unavailable."
-
-echo "This publishes the two DefenseOps profiles to ${CONTAINER}. Existing files are backed up."
-read -r -p "Continue? [y/N] " answer
-[[ "${answer,,}" == y || "${answer,,}" == yes ]] || { echo "Cancelled."; exit 0; }
-
-STAMP="$(date +%Y%m%d-%H%M%S)"
-for group in "${GROUPS[@]}"; do
-  src="${BUNDLE_DIR}/profiles/${group}/agent.conf"
-  [[ -s "$src" ]] || die "Missing profile: $src"
-  if ! docker exec "$CONTAINER" /var/ossec/bin/agent_groups -l 2>/dev/null |
-       grep -Eq "^[[:space:]]*${group}([[:space:]]|$)"; then
-    docker exec "$CONTAINER" /var/ossec/bin/agent_groups -a -g "$group" -q
-  fi
-  dir="/var/ossec/etc/shared/${group}"
-  tmp="${dir}/agent.conf.tmp.${STAMP}"
-  docker exec "$CONTAINER" install -d -o wazuh -g wazuh -m 0750 "$dir"
-  docker cp "$src" "${CONTAINER}:${tmp}"
-  docker exec "$CONTAINER" chown wazuh:wazuh "$tmp"
-  docker exec "$CONTAINER" chmod 0660 "$tmp"
-  docker exec "$CONTAINER" /var/ossec/bin/verify-agent-conf -f "$tmp"
-  if docker exec "$CONTAINER" test -f "${dir}/agent.conf"; then
-    docker exec "$CONTAINER" cp -a "${dir}/agent.conf" "${dir}/agent.conf.bak.${STAMP}"
-  fi
-  docker exec "$CONTAINER" mv -f "$tmp" "${dir}/agent.conf"
-  docker exec "$CONTAINER" chown wazuh:wazuh "${dir}/agent.conf"
-  docker exec "$CONTAINER" chmod 0660 "${dir}/agent.conf"
-  echo "[INFO] Published profile: ${group}"
-done
-echo "[INFO] Profiles published. Assign group membership to agents separately."
-DEPLOY
-chmod 0750 "${OUT_DIR}/deploy-agent-profiles.sh"
+# Remove a stale artifact from older generator versions. This only affects
+# the generated output directory; it does not touch the Manager or endpoints.
+rm -f -- "${OUT_DIR}/deploy-agent-profiles.sh"
 
 cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
@@ -1905,7 +1857,6 @@ Bundle:
   ossec.conf
   profiles/brebes-waf/agent.conf
   profiles/docker-php/agent.conf
-  deploy-agent-profiles.sh
 
 Endpoint installation / profile update:
   sudo ./install-agent.sh [--name HOSTNAME]
@@ -1945,9 +1896,9 @@ Brebes-WAF:
   Nginx and ModSecurity configuration files are never modified.
 
 Docker-PHP:
-  The base profile does not collect global Docker JSON logs or unrelated
-  containers. Application-specific monitoring will be integrated later with
-  create-php-app.sh / delete-php-app.sh.
+  Enrollment assigns the endpoint to the docker-php Wazuh group.
+  Application-specific monitoring is managed separately by the application
+  deployment workflow. The generator itself does not invoke Docker commands.
 
 Time settings:
   The installer asks independently whether to change timezone to Asia/Jakarta
@@ -1960,10 +1911,11 @@ Security:
   Configuration updates are idempotent, backed up, validated, and rolled back
   on activation failure. Existing unrelated XML content is preserved.
 
-Central profiles:
-  Publish explicitly with sudo ./deploy-agent-profiles.sh.
-  Existing shared agent.conf files are backed up before replacement.
-  Assign Agent group membership separately after enrollment.
+Wazuh group assignment:
+  Brebes-WAF profile is enrolled into group Brebes-WAF.
+  Docker-PHP profile is enrolled into group docker-php.
+  Existing enrolled identities are preserved and are not re-enrolled;
+  their existing Manager-side group membership is left unchanged.
 EOF
 chmod 0640 "${OUT_DIR}/README.txt"
 
@@ -1977,7 +1929,7 @@ CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
 TMP_ARCHIVE="$(mktemp "${OUT_DIR}/.defenseops-agent-bundle.XXXXXX")"
 
 tar -czf "$TMP_ARCHIVE" -C "$OUT_DIR" \
-  install-agent.sh ossec.conf README.txt profiles deploy-agent-profiles.sh
+  install-agent.sh ossec.conf README.txt profiles
 chmod 0640 "$TMP_ARCHIVE"
 mv -f "$TMP_ARCHIVE" "$ARCHIVE_PATH"
 TMP_ARCHIVE=""
@@ -1992,6 +1944,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf, docker-php. Existing Agents are prompted: reset/re-enroll or preserve and repair missing settings."
+log "Profiles: brebes-waf -> Brebes-WAF; docker-php -> docker-php."
+log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
