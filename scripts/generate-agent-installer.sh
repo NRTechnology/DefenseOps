@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.1
+# Version     : 1.8.2
 # Release     : 2026-11-09
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.8.2"
 SCRIPT_RELEASE="2026-11-10"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.1"
+INSTALLER_VERSION="1.8.2"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -1435,8 +1435,8 @@ if (( AGENT_ENROLLED == 0 )); then
         curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH |
           gpg --dearmor --yes -o /usr/share/keyrings/wazuh.gpg
         chmod 0644 /usr/share/keyrings/wazuh.gpg
-        printf '%s\\n' \\
-          'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \\
+        printf '%s\n' \
+          'deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main' \
           > /etc/apt/sources.list.d/wazuh.list
         apt-get update
         apt-get install -y "wazuh-agent=${WAZUH_AGENT_VERSION}-1"
