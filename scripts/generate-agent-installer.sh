@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.5
-# Release     : 2026-11-10
+# Version     : 1.8.6
+# Release     : 2026-11-13
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.5"
+SCRIPT_VERSION="1.8.6"
 SCRIPT_RELEASE="2026-11-13"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.5"
+INSTALLER_VERSION="1.8.6"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -1713,13 +1713,13 @@ if profile == "brebes-waf":
     # localfile entries (including error/debug/system logs) remain untouched.
     removed_counter = [0]
     localfile_pattern = re.compile(
-        r"<localfile\\b[^>]*>.*?</localfile\\s*>",
+        r"<localfile\b[^>]*>.*?</localfile\s*>",
         flags=re.DOTALL | re.IGNORECASE,
     )
     def remove_obsolete_access_log(match):
         block = match.group(0)
         location = re.search(
-            r"<location\\b[^>]*>\\s*(.*?)\\s*</location\\s*>",
+            r"<location\b[^>]*>\s*(.*?)\s*</location\s*>",
             block,
             flags=re.DOTALL | re.IGNORECASE,
         )
