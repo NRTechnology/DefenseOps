@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.4
+# Version     : 1.8.5
 # Release     : 2026-11-10
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.4"
-SCRIPT_RELEASE="2026-11-10"
+SCRIPT_VERSION="1.8.5"
+SCRIPT_RELEASE="2026-11-13"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.4"
+INSTALLER_VERSION="1.8.5"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -623,9 +623,28 @@ for index, server in enumerate(servers, 1):
     names = [item for args in direct(server, "server_name") for item in args]
     vhost = ",".join(names) if names else f"<server-block-{index}-without-server_name>"
 
-    # Deliberately inspect only access_log directives explicitly configured
-    # inside this server block or its descendants. The global http-level
-    # access_log is intentionally ignored by the Brebes-WAF policy.
+    # Accept a dedicated verified JSON log at http scope (e.g. conf.d),
+    # while excluding the conventional global text access.log.
+    for args in direct(http, "access_log"):
+        if not args:
+            continue
+        path = args[0]
+        if path in ("off", "/var/log/nginx/access.log"):
+            continue
+        if not path.startswith("/") or "$" in path or "\\t" in path:
+            continue
+        fmt = "combined"
+        for candidate in args[1:]:
+            if candidate.startswith(("buffer=", "gzip=", "flush=", "if=")):
+                continue
+            fmt = candidate
+            break
+        if formats.get(fmt, False):
+            rows.append(("<http-context>", path, fmt, "json"))
+        else:
+            print(f"[INFO] Ignoring non-JSON http-level access_log: {path} (format={fmt})")
+
+    # Explicit virtual-host/nested access logs retain strict JSON validation.
     explicit_access = []
     for descendant in walk(server):
         explicit_access.extend(direct(descendant, "access_log"))
@@ -635,9 +654,9 @@ for index, server in enumerate(servers, 1):
             failures.append((vhost, "<unknown>", "empty access_log directive"))
             continue
         path = args[0]
-        if path == "off":
+        if path in ("off", "/var/log/nginx/access.log"):
             continue
-        if not path.startswith("/") or "$" in path or "\t" in path:
+        if not path.startswith("/") or "$" in path or "\\t" in path:
             failures.append((vhost, path, "dynamic/non-file access_log path cannot be monitored safely"))
             continue
 
@@ -1674,6 +1693,8 @@ if profile == "brebes-waf":
         if len(parts) != 2:
             raise SystemExit(f"Invalid discovered log entry: {raw!r}")
         path, fmt = parts[0].strip(), parts[1].strip()
+        if path == "/var/log/nginx/access.log":
+            continue
         if path:
             if path in paths and paths[path] != fmt:
                 raise SystemExit(f"Conflicting log formats discovered for {path}")
@@ -1687,6 +1708,32 @@ if profile == "brebes-waf":
             existing_locations[location.text.strip()] = (
                 (log_format.text or "default").strip() if log_format is not None else "default"
             )
+
+    # Remove only the obsolete global Nginx access.log input. All other
+    # localfile entries (including error/debug/system logs) remain untouched.
+    removed_counter = [0]
+    localfile_pattern = re.compile(
+        r"<localfile\\b[^>]*>.*?</localfile\\s*>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    def remove_obsolete_access_log(match):
+        block = match.group(0)
+        location = re.search(
+            r"<location\\b[^>]*>\\s*(.*?)\\s*</location\\s*>",
+            block,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if location and location.group(1).strip() == "/var/log/nginx/access.log":
+            removed_counter[0] += 1
+            return ""
+        return block
+
+    text = localfile_pattern.sub(remove_obsolete_access_log, text)
+    if removed_counter[0]:
+        print(
+            f"[INFO] Removed {removed_counter[0]} obsolete localfile entry/entries "
+            "for /var/log/nginx/access.log; unrelated inputs were preserved."
+        )
 
     additions = []
     for path, fmt in paths.items():
@@ -1929,9 +1976,11 @@ Endpoint installation / profile update:
 Brebes-WAF:
   Discovery runs on the Brebes-WAF endpoint by recursively parsing the active
   Nginx main configuration and its include files in their original contexts.
-  Global http-level access_log directives are intentionally ignored. Every
-  explicit access_log inside a virtual-host/server or nested context must use a
-  log_format verified as a JSON object using escape=json. Explicit access_log off
+  The conventional global /var/log/nginx/access.log is intentionally excluded.
+  A dedicated http-level Brebes-WAF access log is accepted when its log_format
+  is verified as a JSON object using escape=json; this supports the dedicated
+  access.json file defined from conf.d. Explicit virtual-host/server or nested
+  access_log directives must also use verified JSON. Explicit access_log off
   directives are skipped. Non-JSON or unsafe vhost access logs abort installation
   before package installation, enrollment, or Agent configuration changes.
   SecAuditLogType, SecAuditLog, SecAuditLogStorageDir, and SecDebugLog are
