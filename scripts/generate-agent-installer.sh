@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.7
+# Version     : 1.8.9
 # Release     : 2026-11-13
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.8"
-SCRIPT_RELEASE="2026-11-13"
+SCRIPT_VERSION="1.8.9"
+SCRIPT_RELEASE="2026-11-14"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.8"
+INSTALLER_VERSION="1.8.9"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -1608,6 +1608,9 @@ RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
 UNIT
   chown root:root /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$
   chmod 0644 /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$
@@ -1628,6 +1631,79 @@ UNIT
   log "ModSecurity collector staged: ${parser}"
 }
 
+ensure_collector_unit_install_config(){
+  local unit="/etc/systemd/system/defenseops-modsecurity-collector.service"
+  [[ -f "$unit" ]] || die "Collector systemd unit not found: $unit"
+
+  # Repair only the [Install] metadata. Preserve [Unit], [Service], and any
+  # other existing directives so an installer update does not rewrite
+  # unrelated service behavior.
+  python3 - "$unit" <<'PYUNIT'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    original = path.read_text(encoding="utf-8")
+except OSError as exc:
+    raise SystemExit(f"[ERROR] Cannot read collector unit {path}: {exc}")
+
+lines = original.splitlines()
+install_start = None
+install_end = len(lines)
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if stripped == "[Install]" and install_start is None:
+            install_start = index
+        elif install_start is not None:
+            install_end = index
+            break
+
+if install_start is None:
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines:
+        lines.append("")
+    lines.extend(["[Install]", "WantedBy=multi-user.target"])
+else:
+    section = lines[install_start + 1:install_end]
+    section = [
+        line for line in section
+        if not line.strip().startswith("WantedBy=")
+    ]
+    section.append("WantedBy=multi-user.target")
+    lines = lines[:install_start + 1] + section + lines[install_end:]
+
+updated = "\n".join(lines).rstrip() + "\n"
+if updated != original:
+    old_stat = path.stat()
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chown(temporary, old_stat.st_uid, old_stat.st_gid)
+        os.chmod(temporary, stat.S_IMODE(old_stat.st_mode))
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    print("[INFO] Repaired collector unit [Install] metadata.")
+else:
+    print("[INFO] Collector unit [Install] metadata is already correct.")
+PYUNIT
+}
+
 activate_modsecurity_collector(){
   (( MODSEC_COLLECTOR_ENABLED == 1 )) || return 0
   if getent group wazuh >/dev/null 2>&1; then
@@ -1636,11 +1712,17 @@ activate_modsecurity_collector(){
     chmod 0640 /var/log/defenseops/modsecurity-events.json
   fi
   systemctl disable --now defenseops-modsecurity-collector.timer >/dev/null 2>&1 || true
+
+  ensure_collector_unit_install_config
   systemctl daemon-reload
-  systemctl enable --now defenseops-modsecurity-collector.service
+  systemctl enable defenseops-modsecurity-collector.service
+  systemctl is-enabled --quiet defenseops-modsecurity-collector.service ||
+    die "DefenseOps ModSecurity collector is not enabled for startup."
+
+  systemctl start defenseops-modsecurity-collector.service
   systemctl is-active --quiet defenseops-modsecurity-collector.service ||
     die "DefenseOps ModSecurity collector daemon failed to start."
-  log "DefenseOps ModSecurity collector daemon is active (inotify + internal scheduler)."
+  log "DefenseOps ModSecurity collector daemon is active and enabled at boot (inotify + internal scheduler)."
 }
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
