@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.6
+# Version     : 1.8.7
 # Release     : 2026-11-13
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.6"
+SCRIPT_VERSION="1.8.8"
 SCRIPT_RELEASE="2026-11-13"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.6"
+INSTALLER_VERSION="1.8.8"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -797,6 +797,7 @@ stage_modsecurity_collector(){
 from __future__ import annotations
 
 import argparse
+import fcntl
 import datetime as dt
 import gzip
 import json
@@ -808,6 +809,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 MARKER_RE = re.compile(r'^---[A-Za-z0-9]+---([A-Z])--\s*$', re.M)
@@ -881,13 +883,19 @@ def source_for(rule_file: str, tags: list[str]) -> str:
     return 'unknown'
 
 
-def parse_audit(path: Path, hostname: str) -> list[dict]:
+class IncompleteAuditError(Exception):
+    """Raised when a Concurrent audit file has not reached its terminal Z section."""
+
+
+def parse_audit(path: Path, hostname: str) -> Iterator[dict]:
     try:
         raw = path.read_text(encoding='utf-8', errors='replace')
     except OSError:
         raise
     if not re.search(r'(?m)^---[A-Za-z0-9]+---Z--\s*$', raw):
-        return []
+        if re.search(r'(?m)^---[A-Za-z0-9]+---A--\s*$', raw):
+            raise IncompleteAuditError(f'audit transaction is not complete yet: {path}')
+        return
 
     sections = parse_sections(raw)
     a_lines = (sections.get('A') or '').strip().splitlines()
@@ -939,7 +947,6 @@ def parse_audit(path: Path, hostname: str) -> list[dict]:
         for line in (sections.get('H') or '').splitlines()
         if line.strip().startswith('ModSecurity:')
     ]
-    events = []
     for line in h_lines:
         meta = attrs(line)
         rule_id = first(meta, 'id')
@@ -1015,8 +1022,7 @@ def parse_audit(path: Path, hostname: str) -> list[dict]:
                 else:
                     context['matched_data'] = sanitize(matched_data)
             event['attack_context'] = context
-        events.append(event)
-    return events
+        yield event
 
 
 def load_config(path: Path) -> dict:
@@ -1047,6 +1053,22 @@ def ensure_state_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_processed_at ON processed(processed_at)'
     )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS file_checkpoint (
+            path TEXT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            event_cursor INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            retry_at REAL NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at REAL NOT NULL
+        )'''
+    )
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_file_checkpoint_status '
+        'ON file_checkpoint(status, retry_at)'
+    )
     conn.commit()
 
 
@@ -1056,6 +1078,13 @@ def prune_state(conn: sqlite3.Connection, retention_days: int) -> int:
         'DELETE FROM processed WHERE processed_at IS NOT NULL AND processed_at < ?',
         (cutoff,)
     )
+    conn.commit()
+    return cur.rowcount
+
+
+def prune_file_checkpoints(conn: sqlite3.Connection, retention_days: int) -> int:
+    cutoff = time.time() - retention_days * 86400
+    cur = conn.execute('DELETE FROM file_checkpoint WHERE updated_at < ?', (cutoff,))
     conn.commit()
     return cur.rowcount
 
@@ -1140,9 +1169,49 @@ def append_events(output: Path, lines: list[str], max_bytes: int) -> int:
     return written
 
 
+def file_signature(path: Path, st: os.stat_result) -> str:
+    return f'{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}'
+
+
+def checkpoint_file(
+    conn: sqlite3.Connection, path: str, signature: str, status: str,
+    event_cursor: int = 0, attempts: int = 0, retry_at: float = 0,
+    last_error: str | None = None
+) -> None:
+    conn.execute(
+        '''INSERT INTO file_checkpoint
+           (path, signature, status, event_cursor, attempts, retry_at, last_error, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(path) DO UPDATE SET
+             signature=excluded.signature, status=excluded.status,
+             event_cursor=excluded.event_cursor, attempts=excluded.attempts,
+             retry_at=excluded.retry_at, last_error=excluded.last_error,
+             updated_at=excluded.updated_at''',
+        (path, signature, status, event_cursor, attempts, retry_at, last_error, time.time())
+    )
+
+
+def append_batch(
+    conn: sqlite3.Connection, output: Path, batch: list[tuple[str, str, str]],
+    max_output_bytes: int
+) -> int:
+    if not batch:
+        return 0
+    # Output is flushed before deduplication/checkpoint rows are committed.
+    append_events(output, [item[2] for item in batch], max_output_bytes)
+    now = time.time()
+    conn.executemany(
+        'INSERT OR IGNORE INTO processed(txid, rule_id, processed_at) VALUES (?, ?, ?)',
+        [(item[0], item[1], now) for item in batch]
+    )
+    conn.commit()
+    return len(batch)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default='/etc/defenseops/modsecurity-collector.json')
+    ap.add_argument('--once', action='store_true', help='run one reconciliation and processing pass (test mode)')
     args = ap.parse_args()
     config = load_config(Path(args.config))
 
@@ -1159,84 +1228,310 @@ def main() -> int:
     archive_retention_days = int(config.get('archive_retention_days', 90))
     state_retention_days = int(config.get('state_retention_days', 180))
     source_max_age_days = int(config.get('source_max_age_days', 180))
-    if min(archive_retention_days, state_retention_days, source_max_age_days) < 1:
-        raise SystemExit('[ERROR] Retention periods must be positive integers.')
-    if max_output_bytes < 1024 * 1024:
-        raise SystemExit('[ERROR] max_output_bytes must be at least 1 MiB.')
+    max_files_per_run = int(config.get('max_files_per_run', 500))
+    max_events_per_run = int(config.get('max_events_per_run', 1000))
+    max_batch_bytes = int(config.get('max_batch_bytes', 1048576))
+    retry_base_seconds = int(config.get('retry_base_seconds', 30))
+    retry_max_seconds = int(config.get('retry_max_seconds', 1800))
+    reconcile_seconds = int(config.get('reconcile_seconds', 600))
+    idle_wait_seconds = float(config.get('idle_wait_seconds', 1.0))
+    if min(archive_retention_days, state_retention_days, source_max_age_days,
+           max_files_per_run, max_events_per_run, max_batch_bytes,
+           retry_base_seconds, retry_max_seconds, reconcile_seconds) < 1:
+        raise SystemExit('[ERROR] Collector limits and scheduler intervals must be positive.')
+    if max_output_bytes < 1024 * 1024 or retry_max_seconds < retry_base_seconds:
+        raise SystemExit('[ERROR] Invalid output or retry limits.')
 
     output.parent.mkdir(parents=True, exist_ok=True)
     state.parent.mkdir(parents=True, exist_ok=True)
-    hostname = socket.gethostname()
-    conn = sqlite3.connect(state)
-    ensure_state_schema(conn)
-    pruned_state = prune_state(conn, state_retention_days)
-    if pruned_state:
-        print(f'[INFO] Pruned {pruned_state} SQLite deduplication record(s) older than {state_retention_days} days')
+    lock_path = state.with_name(state.name + '.collector.lock')
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('[ERROR] Another collector daemon owns the lock; exiting.', file=sys.stderr)
+            return 1
 
-    now = time.time()
-    source_cutoff = now - source_max_age_days * 86400
-    added_lines: list[str] = []
-    seen_paths: set[str] = set()
+        # Linux inotify via libc: no third-party Python package is required.
+        import ctypes
+        import select
+        import struct
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.inotify_init1.argtypes = [ctypes.c_int]
+        libc.inotify_init1.restype = ctypes.c_int
+        libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        libc.inotify_add_watch.restype = ctypes.c_int
+        libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.inotify_rm_watch.restype = ctypes.c_int
+        IN_NONBLOCK = os.O_NONBLOCK
+        IN_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
+        IN_CLOSE_WRITE = 0x00000008
+        IN_MOVED_TO = 0x00000080
+        IN_CREATE = 0x00000100
+        IN_DELETE_SELF = 0x00000400
+        IN_MOVE_SELF = 0x00000800
+        IN_Q_OVERFLOW = 0x00004000
+        IN_IGNORED = 0x00008000
+        WATCH_MASK = IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE_SELF | IN_MOVE_SELF
+        EVENT_HEADER = struct.Struct('iIII')
+        inotify_fd = libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+        if inotify_fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
 
-    for root in roots:
-        candidates = (
-            [root] if root.is_file()
-            else sorted(p for p in root.rglob('*') if p.is_file())
-            if root.is_dir()
-            else []
-        )
-        if not candidates:
-            print(f'[WARN] Audit root not found or empty: {root}', file=sys.stderr)
-        for path in candidates:
+        hostname = socket.gethostname()
+        conn = sqlite3.connect(state, timeout=30)
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=FULL')
+        watch_paths: dict[int, str] = {}
+
+        def add_watch(directory: Path) -> None:
             try:
+                wd = libc.inotify_add_watch(inotify_fd, os.fsencode(str(directory)), WATCH_MASK)
+                if wd >= 0:
+                    watch_paths[wd] = str(directory)
+                else:
+                    err = ctypes.get_errno()
+                    print(f'[WARN] Cannot watch {directory}: {os.strerror(err)}', file=sys.stderr)
+            except OSError as exc:
+                print(f'[WARN] Cannot watch {directory}: {exc}', file=sys.stderr)
+
+        def watch_tree() -> None:
+            for root in roots:
+                if root.is_file():
+                    add_watch(root.parent)
+                    continue
+                if not root.is_dir():
+                    print(f'[WARN] Audit root unavailable: {root}', file=sys.stderr)
+                    continue
+                for current, dirs, _files in os.walk(root):
+                    dirs[:] = [d for d in dirs if not (Path(current) / d).is_symlink()]
+                    add_watch(Path(current))
+
+        def enqueue_path(path: Path) -> None:
+            try:
+                if path.name == 'debug.log' or not path.is_file():
+                    return
+                st = path.stat()
+                now = time.time()
+                if st.st_size < 20 or st.st_mtime < now - source_max_age_days * 86400:
+                    return
+                if baseline is not None and st.st_mtime < baseline:
+                    return
                 resolved = str(path.resolve())
-                if resolved in seen_paths:
+                signature = file_signature(path, st)
+                row = conn.execute(
+                    'SELECT signature,status FROM file_checkpoint WHERE path=?', (resolved,)
+                ).fetchone()
+                if row and row[0] == signature:
+                    # done/pending/failed are already represented in the durable queue.
+                    return
+                checkpoint_file(conn, resolved, signature, 'pending', 0, 0, 0, None)
+                conn.commit()
+            except (OSError, sqlite3.Error) as exc:
+                print(f'[WARN] Discovery cannot register {path}: {exc}', file=sys.stderr)
+
+        def reconcile() -> None:
+            print('[INFO] Periodic reconciliation started.', file=sys.stderr)
+            for root in roots:
+                if root.is_file():
+                    enqueue_path(root)
                     continue
-                seen_paths.add(resolved)
-                stat = path.stat()
-                if baseline is not None and stat.st_mtime < baseline:
+                if not root.is_dir():
                     continue
-                # Align source-file scan horizon with SQLite dedup retention so
-                # pruning old keys cannot replay old retained audit transactions.
-                if stat.st_mtime < source_cutoff:
+                # Streaming traversal: never materialize or sort the full path set.
+                for current, dirs, files in os.walk(root):
+                    dirs[:] = [d for d in dirs if not (Path(current) / d).is_symlink()]
+                    add_watch(Path(current))
+                    for filename in files:
+                        enqueue_path(Path(current) / filename)
+            print('[INFO] Periodic reconciliation completed.', file=sys.stderr)
+
+        def recover_interrupted() -> None:
+            cur = conn.execute(
+                "UPDATE file_checkpoint SET status='pending', retry_at=0, updated_at=? WHERE status='processing'",
+                (time.time(),)
+            )
+            conn.commit()
+            if cur.rowcount:
+                print(f'[WARN] Recovered {cur.rowcount} interrupted file job(s).', file=sys.stderr)
+
+        def process_queue() -> None:
+            now = time.time()
+            rows = conn.execute(
+                """SELECT path,signature,event_cursor,attempts,status FROM file_checkpoint
+                   WHERE status='pending' OR (status='failed' AND retry_at<=?)
+                   ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, updated_at ASC
+                   LIMIT ?""", (now, max_files_per_run)
+            ).fetchall()
+            if not rows:
+                return
+            batch: list[tuple[str, str, str]] = []
+            batch_bytes = 0
+            files_attempted = events_written = files_completed = 0
+
+            def flush_batch() -> None:
+                nonlocal batch, batch_bytes, events_written
+                if batch:
+                    events_written += append_batch(conn, output, batch, max_output_bytes)
+                    batch = []
+                    batch_bytes = 0
+
+            for resolved, signature, saved_cursor, saved_attempts, old_status in rows:
+                if events_written >= max_events_per_run:
+                    break
+                claimed = conn.execute(
+                    "UPDATE file_checkpoint SET status='processing',updated_at=? WHERE path=? AND signature=? AND status=?",
+                    (time.time(), resolved, signature, old_status)
+                )
+                conn.commit()
+                if claimed.rowcount != 1:
                     continue
-                if stat.st_size < 20:
-                    continue
-                for event in parse_audit(path, hostname):
-                    txid = str(event.get('transaction_id', ''))
-                    rule_id = str(event['waf']['rule_id'])
-                    cur = conn.execute(
-                        'INSERT OR IGNORE INTO processed(txid, rule_id, processed_at) VALUES (?, ?, ?)',
-                        (txid, rule_id, time.time())
-                    )
-                    if cur.rowcount == 0:
+                files_attempted += 1
+                path = Path(resolved)
+                cursor = int(saved_cursor or 0)
+                attempts = int(saved_attempts or 0)
+                try:
+                    st = path.stat()
+                    current_signature = file_signature(path, st)
+                    if current_signature != signature:
+                        checkpoint_file(conn, resolved, current_signature, 'pending', 0, 0, 0, None)
+                        conn.commit()
                         continue
-                    added_lines.append(json.dumps(
-                        event, ensure_ascii=False, separators=(',', ':')
-                    ) + '\n')
-            except (OSError, UnicodeError, sqlite3.Error) as exc:
-                print(f'[WARN] Cannot process {path}: {exc}', file=sys.stderr)
+                    event_index = 0
+                    file_complete = True
+                    for event in parse_audit(path, hostname):
+                        if event_index < cursor:
+                            event_index += 1
+                            continue
+                        txid = str(event.get('transaction_id', ''))
+                        rule_id = str(event['waf']['rule_id'])
+                        already = conn.execute(
+                            'SELECT 1 FROM processed WHERE txid=? AND rule_id=?', (txid, rule_id)
+                        ).fetchone()
+                        if already:
+                            event_index += 1
+                            cursor = event_index
+                            continue
+                        line = json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n'
+                        encoded_size = len(line.encode('utf-8'))
+                        if encoded_size > max_batch_bytes:
+                            raise ValueError(f'event size {encoded_size} exceeds max_batch_bytes={max_batch_bytes}')
+                        if events_written + len(batch) >= max_events_per_run:
+                            file_complete = False
+                            break
+                        if batch and batch_bytes + encoded_size > max_batch_bytes:
+                            flush_batch()
+                        batch.append((txid, rule_id, line))
+                        batch_bytes += encoded_size
+                        event_index += 1
+                        cursor = event_index
+                        if batch_bytes >= max_batch_bytes or events_written + len(batch) >= max_events_per_run:
+                            flush_batch()
+                            checkpoint_file(conn, resolved, signature, 'pending', cursor, attempts, 0, None)
+                            conn.commit()
+                        if events_written >= max_events_per_run:
+                            file_complete = False
+                            break
+                    # Do not mark a file done if it changed while being read.
+                    latest_signature = file_signature(path, path.stat())
+                    if latest_signature != signature:
+                        flush_batch()
+                        checkpoint_file(conn, resolved, latest_signature, 'pending', 0, 0, 0, None)
+                        conn.commit()
+                        continue
+                    flush_batch()
+                    if file_complete:
+                        checkpoint_file(conn, resolved, signature, 'done', event_index, 0, 0, None)
+                        files_completed += 1
+                    else:
+                        checkpoint_file(conn, resolved, signature, 'pending', cursor, attempts, 0, None)
+                    conn.commit()
+                except (OSError, UnicodeError, sqlite3.Error, ValueError, IncompleteAuditError) as exc:
+                    flush_batch()
+                    attempts += 1
+                    delay = min(retry_max_seconds, retry_base_seconds * (2 ** min(attempts - 1, 10)))
+                    checkpoint_file(conn, resolved, signature, 'failed', cursor, attempts,
+                                    time.time() + delay, str(exc)[:1000])
+                    conn.commit()
+                    print(f'[WARN] Cannot complete {path}; retry in {delay}s: {exc}', file=sys.stderr)
+            output.touch(exist_ok=True)
+            if files_attempted:
+                print(f'[INFO] Queue cycle: attempted={files_attempted}, completed={files_completed}, events={events_written}', file=sys.stderr)
 
-    if added_lines:
-        written = append_events(output, added_lines, max_output_bytes)
-        conn.commit()
-        print(f'[INFO] Appended {written} ModSecurity event(s) to {output}')
-    else:
-        # Ensure the watched file exists even when there are no new events.
-        output.touch(exist_ok=True)
-        conn.commit()
-    conn.close()
+        ensure_state_schema(conn)
+        recover_interrupted()
+        watch_tree()
+        # Watch is installed before initial reconciliation to close the startup race.
+        reconcile()
+        next_reconcile = time.monotonic() + reconcile_seconds
+        print(f'[INFO] Collector daemon started; reconciliation interval={reconcile_seconds}s.', file=sys.stderr)
 
-    removed_archives = prune_archives(output, archive_retention_days)
-    if removed_archives:
-        print(f'[INFO] Removed {removed_archives} expired ModSecurity archive(s) older than {archive_retention_days} days')
-    return 0
+        try:
+            while True:
+                # Drain filesystem notifications without retaining an unbounded in-memory queue.
+                try:
+                    readable, _, _ = select.select([inotify_fd], [], [], idle_wait_seconds)
+                    if readable:
+                        data = os.read(inotify_fd, 256 * 1024)
+                        offset = 0
+                        overflow = False
+                        while offset + EVENT_HEADER.size <= len(data):
+                            wd, mask, cookie, name_len = EVENT_HEADER.unpack_from(data, offset)
+                            offset += EVENT_HEADER.size
+                            raw_name = data[offset:offset + name_len].split(b'\0', 1)[0]
+                            offset += name_len
+                            if mask & IN_Q_OVERFLOW:
+                                overflow = True
+                                continue
+                            parent = Path(watch_paths.get(wd, ''))
+                            target = parent / os.fsdecode(raw_name) if raw_name else parent
+                            if mask & (IN_CREATE | IN_MOVED_TO) and target.is_dir():
+                                # Watch first, then reconcile the new subtree to close the
+                                # mkdir->watch installation race for files created immediately.
+                                for current, dirs, files in os.walk(target):
+                                    dirs[:] = [d for d in dirs if not (Path(current) / d).is_symlink()]
+                                    add_watch(Path(current))
+                                    for filename in files:
+                                        enqueue_path(Path(current) / filename)
+                            if mask & (IN_CLOSE_WRITE | IN_MOVED_TO) and target.is_file():
+                                enqueue_path(target)
+                            if mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED):
+                                watch_paths.pop(wd, None)
+                        if overflow:
+                            print('[WARN] Inotify queue overflow; forcing reconciliation.', file=sys.stderr)
+                            watch_tree()
+                            reconcile()
+                            next_reconcile = time.monotonic() + reconcile_seconds
+                except BlockingIOError:
+                    pass
+                except OSError as exc:
+                    print(f'[WARN] Inotify read failed; rebuilding watches and reconciling: {exc}', file=sys.stderr)
+                    watch_tree()
+                    reconcile()
+                    next_reconcile = time.monotonic() + reconcile_seconds
+
+                if time.monotonic() >= next_reconcile:
+                    watch_tree()
+                    reconcile()
+                    next_reconcile = time.monotonic() + reconcile_seconds
+                process_queue()
+                if args.once:
+                    break
+        except KeyboardInterrupt:
+            print('[INFO] Collector daemon stopping.', file=sys.stderr)
+        finally:
+            os.close(inotify_fd)
+            conn.close()
+    finally:
+        os.close(lock_fd)
     return 0
 
 
 if __name__ == '__main__':
     raise SystemExit(main())
-
 PYCOLLECTOR
   chown root:root "$parser_tmp"
   chmod 0750 "$parser_tmp"
@@ -1264,16 +1559,32 @@ if config_path.is_file():
         baseline = float(old.get("baseline_epoch", baseline))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
-data = {
+data = {}
+if config_path.is_file():
+    try:
+        previous = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(previous, dict):
+            data.update(previous)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+# Preserve existing paths, baseline and operator-tuned limits where present.
+data.update({
     "roots": roots,
-    "output": "/var/log/defenseops/modsecurity-events.json",
-    "state": "/var/lib/defenseops/modsecurity-state.sqlite3",
+    "output": data.get("output", "/var/log/defenseops/modsecurity-events.json"),
+    "state": data.get("state", "/var/lib/defenseops/modsecurity-state.sqlite3"),
     "baseline_epoch": baseline,
-    "max_output_bytes": 250000000,
-    "archive_retention_days": 90,
-    "state_retention_days": 180,
-    "source_max_age_days": 180
-}
+    "max_output_bytes": int(data.get("max_output_bytes", 250000000)),
+    "archive_retention_days": int(data.get("archive_retention_days", 90)),
+    "state_retention_days": int(data.get("state_retention_days", 180)),
+    "source_max_age_days": int(data.get("source_max_age_days", 180)),
+    "max_files_per_run": int(data.get("max_files_per_run", 500)),
+    "max_events_per_run": int(data.get("max_events_per_run", 1000)),
+    "max_batch_bytes": int(data.get("max_batch_bytes", 1048576)),
+    "retry_base_seconds": int(data.get("retry_base_seconds", 30)),
+    "retry_max_seconds": int(data.get("retry_max_seconds", 1800)),
+    "reconcile_seconds": int(data.get("reconcile_seconds", 600)),
+    "idle_wait_seconds": float(data.get("idle_wait_seconds", 1.0))
+})
 tmp = config_path.with_suffix(".json.tmp")
 tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 tmp.replace(config_path)
@@ -1287,11 +1598,13 @@ Description=DefenseOps ModSecurity Audit Collector
 After=local-fs.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=root
 Group=root
 UMask=0027
-ExecStart=/usr/bin/python3 /usr/local/libexec/defenseops-modsecurity-collector.py --config /etc/defenseops/modsecurity-collector.json
+ExecStart=/usr/bin/python3 -u /usr/local/libexec/defenseops-modsecurity-collector.py --config /etc/defenseops/modsecurity-collector.json
+Restart=always
+RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
@@ -1300,23 +1613,10 @@ UNIT
   chmod 0644 /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$
   mv -f /etc/systemd/system/.defenseops-modsecurity-collector.service.tmp.$$ /etc/systemd/system/defenseops-modsecurity-collector.service
 
-  cat > /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$ <<'UNIT'
-[Unit]
-Description=Run DefenseOps ModSecurity Audit Collector periodically
+  # Stop the legacy periodic unit before removing it; collector is now a daemon.
+  systemctl disable --now defenseops-modsecurity-collector.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/defenseops-modsecurity-collector.timer
 
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
-AccuracySec=5s
-Persistent=true
-Unit=defenseops-modsecurity-collector.service
-
-[Install]
-WantedBy=timers.target
-UNIT
-  chown root:root /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$
-  chmod 0644 /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$
-  mv -f /etc/systemd/system/.defenseops-modsecurity-collector.timer.tmp.$$ /etc/systemd/system/defenseops-modsecurity-collector.timer
 
   touch "${log_dir}/modsecurity-events.json"
   if getent group wazuh >/dev/null 2>&1; then
@@ -1335,11 +1635,12 @@ activate_modsecurity_collector(){
     chmod 0750 /var/log/defenseops
     chmod 0640 /var/log/defenseops/modsecurity-events.json
   fi
+  systemctl disable --now defenseops-modsecurity-collector.timer >/dev/null 2>&1 || true
   systemctl daemon-reload
-  systemctl enable --now defenseops-modsecurity-collector.timer
-  systemctl is-active --quiet defenseops-modsecurity-collector.timer ||
-    die "DefenseOps ModSecurity collector timer failed to start."
-  log "DefenseOps ModSecurity collector timer is active (30-second interval)."
+  systemctl enable --now defenseops-modsecurity-collector.service
+  systemctl is-active --quiet defenseops-modsecurity-collector.service ||
+    die "DefenseOps ModSecurity collector daemon failed to start."
+  log "DefenseOps ModSecurity collector daemon is active (inotify + internal scheduler)."
 }
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
@@ -1351,7 +1652,7 @@ else
 fi
 
 # Stage the parser only after local ModSecurity discovery has succeeded.
-# Timer activation is deferred until the Wazuh configuration has been validated.
+# Collector daemon activation is deferred until the Wazuh configuration has been validated.
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]] && (( MODSEC_COLLECTOR_ENABLED == 1 )); then
   stage_modsecurity_collector
 fi
@@ -1989,13 +2290,18 @@ Brebes-WAF:
   files are never mistaken for transaction files. SecDebugLog remains collected
   separately as plain-text syslog and is not treated as the audit-event source. A parser writes normalized JSONL
   events, which Wazuh collects with log_format=json. The endpoint installer
-  installs the parser and a systemd timer (30-second interval) automatically;
+  installs the parser as a persistent systemd daemon automatically;
   no manual Python execution is required.
   The installer embeds defenseops-modsecurity-collector.py and installs it at
-  /usr/local/libexec. Its systemd timer scans audit roots every 30 seconds,
-  emits one JSON event per triggered rule, and uses SQLite to avoid duplicates.
-  Initial baseline prevents replaying pre-install audit transactions. Wazuh
-  reads only /var/log/defenseops/modsecurity-events.json as JSON;
+  /usr/local/libexec as one Type=simple daemon. Inotify detects completed/new
+  audit files; an internal scheduler performs streaming reconciliation at the
+  configured interval (default 600 seconds) and retries due queue entries.
+  SQLite stores the persistent work queue and event deduplication state.
+  The daemon installs recursive directory watches, performs reconciliation at
+  startup and periodically, and forces reconciliation after inotify overflow.
+  It does not create a 30-second systemd timer. Initial baseline prevents
+  replaying pre-install audit transactions. Wazuh reads only
+  /var/log/defenseops/modsecurity-events.json as JSON;
   rotates output at 250 MB, retains compressed archives for 90 days,
   and prunes SQLite deduplication state older than 180 days.
   Nginx and ModSecurity configurations are never modified.
