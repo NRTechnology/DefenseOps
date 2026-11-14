@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.9
+# Version     : 1.8.10
 # Release     : 2026-11-13
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.9"
+SCRIPT_VERSION="1.8.10"
 SCRIPT_RELEASE="2026-11-14"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.9"
+INSTALLER_VERSION="1.8.10"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -164,8 +164,8 @@ Options:
 
 At runtime, select Brebes-WAF or Docker-PHP.
 First-time installation requests an enrollment password. Existing Agents
-are asked whether to reset configuration and re-enroll. If declined, existing
-identity/configuration are preserved and only missing profile settings are added.
+are never reinstalled or re-enrolled automatically. Their existing identity is
+preserved and the selected profile configuration is repaired/merged in place.
 EOF
 }
 
@@ -194,6 +194,13 @@ if command -v dpkg-query >/dev/null 2>&1 &&
   AGENT_PACKAGE_INSTALLED=1
 elif command -v rpm >/dev/null 2>&1 && rpm -q wazuh-agent >/dev/null 2>&1; then
   AGENT_PACKAGE_INSTALLED=1
+fi
+
+# A pre-existing/manual installation must never be mistaken for a fresh host
+# merely because its package database is unavailable or incomplete.
+if (( AGENT_PACKAGE_INSTALLED == 0 )) && [[ -x /var/ossec/bin/wazuh-agentd ]]; then
+  AGENT_PACKAGE_INSTALLED=1
+  log "Existing Wazuh Agent binary detected outside the package database; treating endpoint as an existing installation."
 fi
 
 ACTIVE_AGENT_CONF="/var/ossec/etc/ossec.conf"
@@ -234,32 +241,18 @@ if (( AGENT_PACKAGE_INSTALLED == 1 )); then
   echo "  Current Manager : ${ACTIVE_MANAGER:-not detected}"
   if (( AGENT_ENROLLED == 1 )); then
     echo "  Enrollment      : enrolled"
+    log "Existing Agent identity will be preserved; no package reinstall or re-enrollment."
   else
     echo "  Enrollment      : not enrolled"
+    log "Existing package detected without enrollment; package will be retained and enrollment completed."
   fi
-  echo
-  echo "  [Y] Reset existing Agent configuration and enroll again."
-  echo "      Current ossec.conf and client.keys will be backed up."
-  echo "  [N] Preserve existing Agent identity/configuration and add only"
-  echo "      missing settings for the selected profile."
-  read -r -p "Reset configuration and re-enroll? [y/N] " reset_answer
-  case "${reset_answer,,}" in
-    y|yes)
-      RESET_EXISTING=1
-      AGENT_ENROLLED=0
-      AGENT_WAS_ENROLLED=0
-      log "Reset requested; existing configuration and identity will be backed up."
-      ;;
-    *)
-      if [[ -n "$ACTIVE_MANAGER" ]]; then
-        if [[ -n "$MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
-          die "Installed Agent uses Manager '${ACTIVE_MANAGER}'. To change Manager, choose reset/re-enroll."
-        fi
-        MANAGER="$ACTIVE_MANAGER"
-      fi
-      log "Existing Agent identity and configuration will be preserved."
-      ;;
-  esac
+  if [[ -n "$ACTIVE_MANAGER" ]]; then
+    if [[ -n "$MANAGER" && "$MANAGER" != "$ACTIVE_MANAGER" ]]; then
+      die "Installed Agent uses Manager '${ACTIVE_MANAGER}'. Refusing to redirect or re-enroll an existing Agent."
+    fi
+    MANAGER="$ACTIVE_MANAGER"
+  fi
+  log "Selected profile settings will be repaired/merged into the active ossec.conf."
 fi
 [[ "$MANAGER" =~ ^[A-Za-z0-9._:-]+$ ]] || die "Invalid Manager address."
 [[ -n "$AGENT_NAME" ]] || AGENT_NAME="$(hostname -s)"
@@ -2354,7 +2347,7 @@ Endpoint installation / profile update:
   active Manager address against this bundle, repairs only a known placeholder,
   preserves package/client identity/unrelated configuration, and merges only
   missing profile settings. A different valid Manager address causes a safe abort.
-  Existing installations are not re-enrolled or upgraded by package manager.
+  Existing installations are not reinstalled, re-enrolled, or upgraded by package manager.
 
 Brebes-WAF:
   Discovery runs on the Brebes-WAF endpoint by recursively parsing the active
@@ -2403,7 +2396,8 @@ Time settings:
 
 Security:
   Enrollment password is requested only for first-time installation and is
-  never stored in bundle. Existing Agent installations are not re-enrolled.
+  never stored in bundle. Existing enrolled Agent identities are preserved;
+  existing packages are not reinstalled or upgraded.
   Configuration updates are idempotent, backed up, validated, and rolled back
   on activation failure. Existing unrelated XML content is preserved.
 
