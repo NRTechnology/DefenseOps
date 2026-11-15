@@ -48,6 +48,7 @@ REPAIR_ARCHIVES_ONLY=0
 SUMMARY_GROUP_BREBES_WAF="NOT VERIFIED"
 SUMMARY_GROUP_DOCKER_PHP="NOT VERIFIED"
 SUMMARY_CUSTOM_ALERTS="NOT VERIFIED"
+SUMMARY_DOCKER_PHP_CUSTOM_ALERTS="NOT VERIFIED"
 SUMMARY_FILEBEAT_ALERTS="NOT VERIFIED"
 SUMMARY_FILEBEAT_ARCHIVES="NOT VERIFIED"
 SUMMARY_ARCHIVES_HARVESTER="NOT VERIFIED"
@@ -1862,6 +1863,140 @@ PYRULES
     ok "Custom alert rules Brebes-WAF tervalidasi; akan dimuat pada restart Manager yang sudah ada."
 }
 
+ensure_docker_php_custom_rules() {
+    log "Memastikan custom alert rules Docker-PHP tersedia pada volume persisten Wazuh Manager..."
+
+    local container_id
+    container_id="$(docker ps -q --filter 'label=com.defenseops.component=wazuh-manager' | head -n 1)"
+    [[ -n "$container_id" ]] || die "Container Wazuh Manager tidak ditemukan untuk pemasangan custom alert rules Docker-PHP."
+
+    docker exec -i "$container_id" python3 - <<'PYDOCKERPHPRULES' || die "Gagal memasang atau memvalidasi custom rules Docker-PHP."
+from pathlib import Path
+import os, grp, tempfile
+import xml.etree.ElementTree as ET
+
+rules_path = Path("/var/ossec/etc/rules/defenseops_docker_php_rules.xml")
+if rules_path.is_symlink():
+    raise SystemExit(f"Custom rules path berupa symlink; menolak perubahan: {rules_path}")
+if not rules_path.parent.is_dir():
+    raise SystemExit(f"Direktori rules Wazuh tidak ditemukan: {rules_path.parent}")
+
+rules_xml = """<group name="defenseops,docker_php,">
+  <rule id="100600" level="0">
+    <if_sid>86600</if_sid>
+    <field name="integration">^docker-php$</field>
+    <description>DefenseOps: Docker-PHP event received.</description>
+    <group>defenseops,docker_php,</group>
+  </rule>
+  <rule id="100601" level="7">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^fim$</field>
+    <field name="event_type">^file_added$</field>
+    <description>DefenseOps Docker-PHP: New application source file detected.</description>
+    <group>docker_php,fim,file_added,</group>
+  </rule>
+  <rule id="100602" level="10">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^fim$</field>
+    <field name="event_type">^file_modified$</field>
+    <description>DefenseOps Docker-PHP: Application source file modified.</description>
+    <group>docker_php,fim,file_modified,</group>
+  </rule>
+  <rule id="100603" level="7">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^fim$</field>
+    <field name="event_type">^file_deleted$</field>
+    <description>DefenseOps Docker-PHP: Application source file deleted.</description>
+    <group>docker_php,fim,file_deleted,</group>
+  </rule>
+  <rule id="100610" level="5">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^docker_health$</field>
+    <field name="event_type">^container_state_changed$</field>
+    <description>DefenseOps Docker-PHP: Container state changed.</description>
+    <group>docker_php,docker_health,</group>
+  </rule>
+  <rule id="100620" level="8">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^docker_security$</field>
+    <field name="event_type">^container_security_finding$</field>
+    <description>DefenseOps Docker-PHP: Container security baseline finding.</description>
+    <group>docker_php,docker_security,</group>
+  </rule>
+  <rule id="100621" level="3">
+    <if_sid>100600</if_sid>
+    <field name="event_source">^docker_security$</field>
+    <field name="event_type">^container_security_recovered$</field>
+    <description>DefenseOps Docker-PHP: Container security baseline recovered.</description>
+    <group>docker_php,docker_security,docker_security_recovered,</group>
+  </rule>
+</group>
+"""
+
+expected = {
+    "100600": ("0", "86600", {"integration": "^docker-php$"}),
+    "100601": ("7", "100600", {"event_source": "^fim$", "event_type": "^file_added$"}),
+    "100602": ("10", "100600", {"event_source": "^fim$", "event_type": "^file_modified$"}),
+    "100603": ("7", "100600", {"event_source": "^fim$", "event_type": "^file_deleted$"}),
+    "100610": ("5", "100600", {"event_source": "^docker_health$", "event_type": "^container_state_changed$"}),
+    "100620": ("8", "100600", {"event_source": "^docker_security$", "event_type": "^container_security_finding$"}),
+    "100621": ("3", "100600", {"event_source": "^docker_security$", "event_type": "^container_security_recovered$"}),
+}
+def validate(path):
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise SystemExit(f"Custom rules XML tidak valid: {exc}")
+    found = {}
+    for rule in root.iter("rule"):
+        rid = rule.get("id")
+        if rid in expected:
+            if rid in found:
+                raise SystemExit(f"Rule ID duplikat: {rid}")
+            found[rid] = rule
+    missing = sorted(set(expected) - set(found), key=int)
+    if missing:
+        raise SystemExit("Custom rules Docker-PHP tidak lengkap; file dipertahankan. Missing IDs: " + ", ".join(missing))
+    for rid, (level, parent, fields) in expected.items():
+        rule = found[rid]
+        if rule.get("level") != level or (rule.findtext("if_sid") or "").strip() != parent:
+            raise SystemExit(f"Rule {rid}: level/if_sid tidak sesuai; file dipertahankan.")
+        for name, value in fields.items():
+            nodes = [n for n in rule.findall("field") if n.get("name") == name]
+            if len(nodes) != 1 or (nodes[0].text or "").strip() != value:
+                raise SystemExit(f"Rule {rid}: field {name} tidak sesuai; file dipertahankan.")
+    print("Validated Docker-PHP custom rules IDs: " + ", ".join(sorted(found, key=int)))
+
+if rules_path.exists():
+    if not rules_path.is_file():
+        raise SystemExit(f"Custom rules path bukan file reguler: {rules_path}")
+    validate(rules_path)
+    print("Existing Docker-PHP custom rules file preserved; no overwrite.")
+else:
+    ET.fromstring(rules_xml)
+    fd, tmp = tempfile.mkstemp(prefix=".defenseops_docker_php_rules.", dir=str(rules_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(rules_xml)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o640)
+        os.chown(tmp, 0, grp.getgrnam("wazuh").gr_gid)
+        os.replace(tmp, rules_path)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    validate(rules_path)
+    print(f"Installed custom rules file: {rules_path}")
+PYDOCKERPHPRULES
+
+    docker exec "$container_id" /var/ossec/bin/wazuh-analysisd -t \
+        || die "wazuh-analysisd menolak konfigurasi/custom rules Docker-PHP."
+    SUMMARY_DOCKER_PHP_CUSTOM_ALERTS="OK (100600-100603, 100610, 100620-100621)"
+    ok "Custom alert rules Docker-PHP tervalidasi; akan dimuat pada final restart Manager."
+}
+
+
 
 deploy_wazuh() {
     log "Menyiapkan deployment Wazuh ${WAZUH_VERSION}..."
@@ -1889,6 +2024,7 @@ deploy_wazuh() {
     ensure_manager_agent_enrollment
     ensure_manager_agent_groups
     ensure_brebes_waf_custom_rules
+    ensure_docker_php_custom_rules
     configure_effective_manager_archives
     wait_for_manager
     configure_manager_api_tls
@@ -2162,6 +2298,7 @@ print_installation_summary() {
     printf 'Brebes-WAF            : %s\n' "$SUMMARY_GROUP_BREBES_WAF"
     printf 'docker-php            : %s\n' "$SUMMARY_GROUP_DOCKER_PHP"
     printf 'Brebes-WAF custom rules: %s\n' "$SUMMARY_CUSTOM_ALERTS"
+    printf 'Docker-PHP custom rules: %s\n' "$SUMMARY_DOCKER_PHP_CUSTOM_ALERTS"
 
     printf '\n%b[ FILEBEAT ARCHIVES ]%b\n' "$BLUE" "$NC"
     printf 'Filebeat Alerts       : %s\n' "$SUMMARY_FILEBEAT_ALERTS"
@@ -2256,6 +2393,7 @@ main() {
         log "Agent enrollment secret -> component communication checks (Dashboard/Indexer/Manager)."
         log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
         log "Custom alert rules Brebes-WAF: install idempotent 100500-100506 ke volume Manager; validasi analysisd; tanpa restart tambahan."
+        log "Custom alert rules Docker-PHP: install idempotent 100600-100603, 100610, 100620-100621 ke file terpisah pada volume Manager; validasi analysisd; tanpa restart tambahan."
         exit 0
     fi
 
