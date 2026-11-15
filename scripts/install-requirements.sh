@@ -2099,10 +2099,10 @@ finalize_manager_and_verify_archives() {
         # instead of relying on a log line that may never be emitted.
         pipeline_response="$(curl -ksS --connect-timeout 5 --max-time 10 \
             -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
-            -w $'\\n%{http_code}' \
+            -w $'\n%{http_code}' \
             "https://127.0.0.1:9200/_ingest/pipeline/${pipeline_id}" 2>/dev/null || true)"
-        pipeline_http="${pipeline_response##*$'\\n'}"
-        pipeline_response="${pipeline_response%$'\\n'*}"
+        pipeline_http="${pipeline_response##*$'\n'}"
+        pipeline_response="${pipeline_response%$'\n'*}"
         if [[ "$pipeline_http" == "200" ]] &&
            printf '%s' "$pipeline_response" | jq -e --arg id "$pipeline_id" 'has($id)' >/dev/null 2>&1; then
             pipeline_ready=1
