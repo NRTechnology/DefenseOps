@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.10
-# Release     : 2026-11-13
+# Version     : 1.8.11
+# Release     : 2026-11-15
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.10"
-SCRIPT_RELEASE="2026-11-14"
+SCRIPT_VERSION="1.8.11"
+SCRIPT_RELEASE="2026-11-15"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.10"
+INSTALLER_VERSION="1.8.11"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -763,6 +763,253 @@ PYNGINX
   else
     warn "No usable ModSecurity audit source was found. Wazuh Agent will still collect Nginx logs; ModSecurity JSON collection is skipped."
   fi
+}
+
+install_docker_php_monitoring(){
+  local lib_dir="/usr/local/libexec"
+  local config_dir="/etc/defenseops"
+  local state_dir="/var/lib/defenseops/docker-php"
+  local log_dir="/var/log/defenseops"
+  local collector="${lib_dir}/defenseops-docker-php-collector.py"
+
+  command -v docker >/dev/null 2>&1 || warn "Docker CLI not found; Docker-PHP collector will wait until Docker is installed/available."
+  install -d -o root -g root -m 0755 "$lib_dir" "$config_dir"
+  install -d -o root -g root -m 0750 "$state_dir"
+  if getent group wazuh >/dev/null 2>&1; then
+    install -d -o root -g wazuh -m 0750 "$log_dir"
+  else
+    install -d -o root -g root -m 0750 "$log_dir"
+  fi
+
+  cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
+#!/usr/bin/env python3
+"""Registry-scoped Docker-PHP health, security and source-file integrity collector."""
+from __future__ import annotations
+import datetime as dt
+import grp
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REGISTRY = Path("/var/lib/docker-php/monitoring/applications")
+STATE = Path("/var/lib/defenseops/docker-php/state.json")
+OUTPUT = Path("/var/log/defenseops/docker-php-events.json")
+MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILES_PER_APP = 20000
+EXCLUDED = {".git", "vendor", "node_modules", "storage", "cache", "sessions", "tmp", ".idea"}
+SOURCE_SUFFIXES = {".php", ".phtml", ".inc", ".js", ".ts", ".py", ".sh", ".conf", ".ini", ".env.example", ".yaml", ".yml", ".json"}
+
+def emit(app, container, source, event_type, severity, message, details=None):
+    event = {
+        "integration": "docker-php", "schema_version": "1.0",
+        "timestamp": dt.datetime.now().astimezone().isoformat(),
+        "hostname": os.uname().nodename, "application": app,
+        "container": container, "event_source": source,
+        "event_type": event_type, "severity": severity, "message": message,
+        "details": details or {}
+    }
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    os.chmod(OUTPUT, 0o640)
+    try:
+        os.chown(OUTPUT, 0, grp.getgrnam("wazuh").gr_gid)
+    except KeyError:
+        pass
+
+def load_state():
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
+
+def docker_inspect(name):
+    try:
+        p = subprocess.run(["docker", "inspect", name], capture_output=True,
+                           text=True, timeout=15, check=True)
+        result = json.loads(p.stdout)
+        return result[0] if result else None
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, IndexError):
+        return None
+
+def file_manifest(root):
+    result = {}
+    if not root.is_dir():
+        return result
+    count = 0
+    for current, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED and not (Path(current) / d).is_symlink()]
+        for name in files:
+            path = Path(current) / name
+            if path.is_symlink() or path.suffix.lower() not in SOURCE_SUFFIXES:
+                continue
+            try:
+                st = path.stat()
+                if not path.is_file() or st.st_size > MAX_FILE_SIZE:
+                    continue
+                h = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        h.update(chunk)
+                result[str(path)] = h.hexdigest()
+                count += 1
+                if count >= MAX_FILES_PER_APP:
+                    return result
+            except OSError:
+                continue
+    return result
+
+def main():
+    state = load_state()
+    previous = state.get("containers", {})
+    previous_files = state.get("files", {})
+    current_containers, current_files = {}, {}
+    if not REGISTRY.is_dir():
+        print(f"[WARN] Registry directory unavailable: {REGISTRY}", file=sys.stderr)
+        return 0
+    try:
+        registry_files = sorted(REGISTRY.glob("*.json"))
+    except OSError as exc:
+        print(f"[WARN] Cannot enumerate registry: {exc}", file=sys.stderr)
+        return 0
+
+    for registry_file in registry_files:
+        try:
+            cfg = json.loads(registry_file.read_text(encoding="utf-8"))
+            app = cfg.get("application")
+            container = cfg.get("container")
+            source = cfg.get("source")
+            if not all(isinstance(x, str) and x and "\x00" not in x for x in (app, container, source)):
+                print(f"[WARN] Invalid registry entry skipped: {registry_file}", file=sys.stderr)
+                continue
+            # Confine source monitoring to a real directory under /var/apps.
+            source_path = Path(source).resolve(strict=True)
+            apps_root = Path("/var/apps").resolve()
+            if not source_path.is_dir() or not source_path.is_relative_to(apps_root):
+                print(f"[WARN] Source path outside /var/apps or unavailable: {source}", file=sys.stderr)
+                continue
+        except (OSError, ValueError, json.JSONDecodeError, AttributeError) as exc:
+            print(f"[WARN] Invalid registry {registry_file}: {exc}", file=sys.stderr)
+            continue
+
+        inspect = docker_inspect(container)
+        if inspect is None:
+            status = "not_found"
+            details = {"registry": str(registry_file)}
+        else:
+            state_obj = inspect.get("State") or {}
+            health_obj = state_obj.get("Health") or {}
+            status = health_obj.get("Status") or state_obj.get("Status") or "unknown"
+            host = inspect.get("HostConfig") or {}
+            config = inspect.get("Config") or {}
+            security = {
+                "privileged": bool(host.get("Privileged")),
+                "read_only": bool(host.get("ReadonlyRootfs")),
+                "user": config.get("User") or "root(default)",
+                "no_new_privileges": bool(host.get("SecurityOpt") and
+                    any("no-new-privileges" in str(x).lower() for x in host.get("SecurityOpt", []))),
+                "cap_add": host.get("CapAdd") or [],
+                "docker_socket_mounted": any(
+                    "/var/run/docker.sock" in str(x) for x in (host.get("Binds") or [])
+                )
+            }
+            details = {
+                "status": status, "restart_count": inspect.get("RestartCount", 0),
+                "health_failing_streak": health_obj.get("FailingStreak", 0),
+                "security": security
+            }
+            findings = []
+            if security["privileged"]: findings.append("privileged_container")
+            if not security["read_only"]: findings.append("read_only_disabled")
+            if security["user"] in ("", "root", "0", "root(default)"): findings.append("root_user")
+            if not security["no_new_privileges"]: findings.append("no_new_privileges_disabled")
+            if security["docker_socket_mounted"]: findings.append("docker_socket_mounted")
+            details["security_findings"] = findings
+        fingerprint = json.dumps({"status": status, "details": details}, sort_keys=True)
+        current_containers[app] = fingerprint
+        if previous.get(app) != fingerprint:
+            emit(app, container, "docker_health", "container_state_changed",
+                 "high" if status in ("unhealthy", "not_found", "dead") else "info",
+                 "Docker-PHP container state changed", details)
+            if details.get("security_findings"):
+                emit(app, container, "docker_security", "container_security_finding", "medium",
+                     "Docker-PHP container security baseline finding", details)
+        manifest = file_manifest(source_path)
+        current_files[app] = manifest
+        old_manifest = previous_files.get(app)
+        if old_manifest is not None:
+            for path, digest in manifest.items():
+                old = old_manifest.get(path)
+                if old is None:
+                    emit(app, container, "fim", "file_added", "warning",
+                         "New application source file detected", {"path": path, "sha256": digest})
+                elif old != digest:
+                    emit(app, container, "fim", "file_modified", "high",
+                         "Application source file modified", {"path": path, "old_sha256": old, "new_sha256": digest})
+            for path, digest in old_manifest.items():
+                if path not in manifest:
+                    emit(app, container, "fim", "file_deleted", "warning",
+                         "Application source file deleted", {"path": path, "old_sha256": digest})
+
+    save_state({"containers": current_containers, "files": current_files, "updated_at": time.time()})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYDOCKERPHP
+  chown root:root "${collector}.tmp.$$"
+  chmod 0750 "${collector}.tmp.$$"
+  mv -f "${collector}.tmp.$$" "$collector"
+
+  cat > /etc/systemd/system/defenseops-docker-php-collector.service <<'EOF'
+[Unit]
+Description=DefenseOps Docker-PHP registry-scoped security collector
+After=docker.service wazuh-agent.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/defenseops-docker-php-collector.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/defenseops/docker-php /var/log/defenseops
+EOF
+
+  cat > /etc/systemd/system/defenseops-docker-php-collector.timer <<'EOF'
+[Unit]
+Description=Run DefenseOps Docker-PHP collector periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15sec
+Unit=defenseops-docker-php-collector.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now defenseops-docker-php-collector.timer
+  log "Docker-PHP registry-scoped collector installed (health/security/FIM)."
+  log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
 }
 
 stage_modsecurity_collector(){
@@ -2170,8 +2417,25 @@ if profile == "brebes-waf":
                     "  </syscheck>\n" +
                     text[first.start():])
 
-# Docker-PHP deliberately leaves the active local configuration unchanged.
-# Its per-application paths are managed by create-php-app.sh integration.
+elif profile == "docker-php":
+    # Docker-PHP owns only this dedicated JSONL input. No Nginx logs,
+    # global Docker logs, or unrelated container paths are added.
+    docker_php_log = "/var/log/defenseops/docker-php-events.json"
+    existing = set()
+    for node in parsed.iter("localfile"):
+        loc = node.find("location")
+        fmt = node.find("log_format")
+        if loc is not None and loc.text:
+            existing.add((loc.text.strip(), (fmt.text or "default").strip() if fmt is not None else "default"))
+    if (docker_php_log, "json") not in existing:
+        first = blocks[0]
+        close = re.search(r"</ossec_config\s*>", first.group(0))
+        insert_at = first.start() + close.start()
+        text = (text[:insert_at] +
+                "  <localfile>\n"
+                f"    <location>{docker_php_log}</location>\n"
+                "    <log_format>json</log_format>\n"
+                "  </localfile>\n" + text[insert_at:])
 try:
     ET.fromstring("<defenseops_validation_root>" +
                   re.sub(r"^\s*<\?xml[^?]*\?>", "", text, count=1) +
@@ -2261,6 +2525,9 @@ fi
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]] && (( MODSEC_COLLECTOR_ENABLED == 1 )); then
   activate_modsecurity_collector
+fi
+if [[ "$ENDPOINT_PROFILE" == "docker-php" ]]; then
+  install_docker_php_monitoring
 fi
 
 if (( RESET_APPLIED == 1 )); then
@@ -2385,9 +2652,20 @@ Brebes-WAF:
   Nginx and ModSecurity configuration files are never modified.
 
 Docker-PHP:
-  Enrollment assigns the endpoint to the docker-php Wazuh group.
-  Application-specific monitoring is managed separately by the application
-  deployment workflow. The generator itself does not invoke Docker commands.
+  Enrollment assigns the endpoint to the docker-php Wazuh group. The endpoint
+  installer installs a registry-scoped collector which reads only
+  /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
+  Docker containers as monitoring targets and does not collect Nginx logs.
+  The collector checks registered container health/security and performs
+  source-file integrity snapshots (PHP and selected source/config extensions)
+  under each registered source path. Writable/cache/vendor/node_modules/.git
+  trees are excluded. First run establishes a baseline; subsequent changes
+  generate JSONL events at /var/log/defenseops/docker-php-events.json.
+  Wazuh Agent reads that dedicated file as JSON. A systemd timer runs the
+  collector every five minutes. It requires Python 3 and Docker CLI access.
+  Missing Docker or invalid registry entries are warnings; unrelated containers
+  are not added to scope. This initial implementation reports findings only;
+  it does not delete, quarantine, or modify application files.
 
 Time settings:
   The installer asks independently whether to change timezone to Asia/Jakarta
@@ -2434,7 +2712,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF; docker-php -> docker-php."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (registry-scoped collector)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
