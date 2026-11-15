@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.11
+# Version     : 1.8.13
 # Release     : 2026-11-15
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.12"
+SCRIPT_VERSION="1.8.13"
 SCRIPT_RELEASE="2026-11-15"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.12"
+INSTALLER_VERSION="1.8.13"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.9.0."""
+"""DefenseOps Docker-PHP collector v1.9.1."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.9.0"
+COLLECTOR_VERSION = "1.9.1"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -828,26 +828,39 @@ def docker_inspect(name):
     except (OSError,subprocess.SubprocessError,json.JSONDecodeError,IndexError): return None
 
 def inspect_php_fpm_workers(container):
-    # Only PHP-FPM pool worker UIDs count; master UID 0 is not a root finding.
+    # Count only processes whose complete cmdline begins with the PHP-FPM
+    # pool-worker title. The master process and docker exec shell are excluded.
     cmd=r"""
 found=0
 for p in /proc/[0-9]*; do
  [ -r "$p/cmdline" ] || continue
  c=$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null) || continue
+ # Anchored match excludes "php-fpm: master process" and "sh -c ...".
  case "$c" in
-  *"php-fpm: pool "*)
+  "php-fpm: pool "?*)
    u=$(awk '/^Uid:/ {print $2; exit}' "$p/status" 2>/dev/null)
    case "$u" in ''|*[!0-9]*) continue ;; esac
-   printf '%s\n' "$u"; found=1 ;;
+   printf '%s\n' "$u"
+   found=1
+   ;;
  esac
 done
+# No verifiable pool worker is not proof of safety.
 [ "$found" -eq 1 ] || exit 3
 """
-    try: p=subprocess.run(["docker","exec",container,"sh","-c",cmd],capture_output=True,text=True,timeout=10)
-    except (OSError,subprocess.SubprocessError): return {"status":"unknown","worker_uids":[]}
+    try:
+        p=subprocess.run(
+            ["docker","exec",container,"sh","-c",cmd],
+            capture_output=True,text=True,timeout=10
+        )
+    except (OSError,subprocess.SubprocessError):
+        return {"status":"unknown","worker_uids":[]}
+
     uids=sorted({int(x) for x in p.stdout.split() if x.isdigit()})
-    if p.returncode==0 and uids: return {"status":"checked","worker_uids":uids}
-    if p.returncode==3: return {"status":"no_workers","worker_uids":[]}
+    if p.returncode==0 and uids:
+        return {"status":"checked","worker_uids":uids}
+    if p.returncode==3:
+        return {"status":"no_workers","worker_uids":[]}
     return {"status":"unknown","worker_uids":[]}
 
 def file_manifest(root):
@@ -993,7 +1006,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.9.0 installed (health/security/FIM)."
+  log "Docker-PHP registry-scoped collector v1.9.1 installed (health/security/FIM)."
   log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
 }
 
@@ -2579,7 +2592,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.9.0
+Docker-PHP collector : v1.9.1
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -2642,10 +2655,12 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.9.0. Health and security use separate
-  fingerprints. PHP-FPM root detection checks actual pool-worker UIDs; a root
-  master process alone is not reported as root_user. If worker inspection is
-  unavailable, the collector reports needs_review instead of asserting root.
+  The bundled Docker-PHP collector is v1.9.1. Health and security use separate
+  fingerprints. PHP-FPM root detection counts only process command lines beginning with
+  "php-fpm: pool ". The master process and inspection shell are excluded.
+  A verified pool worker running as UID 0 is reported as root_user. If no
+  worker can be verified or inspection fails, the collector reports
+  needs_review instead of asserting the container is safe.
   The collector checks registered container health/security and performs
   source-file integrity snapshots (PHP and selected source/config extensions)
   under each registered source path. Writable/cache/vendor/node_modules/.git
@@ -2702,7 +2717,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (registry-scoped collector v1.9.0)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (registry-scoped collector v1.9.1)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
