@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.13"
+SCRIPT_VERSION="1.8.14"
 SCRIPT_RELEASE="2026-11-15"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.13"
+INSTALLER_VERSION="1.8.14"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -1963,12 +1963,71 @@ activate_modsecurity_collector(){
   log "DefenseOps ModSecurity collector daemon is active and enabled at boot (inotify + internal scheduler)."
 }
 
+# Discover first-level Docker-PHP Compose projects and their matching /var/apps
+# directories. This is endpoint-local and only runs for the Docker-PHP profile.
+DOCKER_PHP_APP_DIRS_FILE=""
+
+discover_docker_php_apps(){
+  local roots=("/opt/docker-apps" "/opt/docker-app")
+  local root project candidate target resolved_target found=0
+  DOCKER_PHP_APP_DIRS_FILE="$(mktemp)"
+
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r -d '' project; do
+      local has_compose=0 app_name
+      for candidate in docker-compose.yml compose.yaml compose.yml; do
+        if [[ -f "$project/$candidate" ]]; then
+          has_compose=1
+          break
+        fi
+      done
+      (( has_compose == 1 )) || continue
+
+      app_name="$(basename -- "$project")"
+      [[ -n "$app_name" && "$app_name" != "." && "$app_name" != ".." ]] || continue
+      [[ "$app_name" != *$'\n'* && "$app_name" != *$'\t'* ]] || {
+        warn "Skipping Docker-PHP project with unsupported directory name."
+        continue
+      }
+
+      target="/var/apps/${app_name}"
+      [[ -d "$target" ]] || {
+        warn "Docker-PHP project '${app_name}' has no matching ${target}; FIM path skipped."
+        continue
+      }
+      resolved_target="$(readlink -f -- "$target")" || continue
+      case "$resolved_target" in
+        /var/apps/*) ;;
+        *)
+          warn "Skipping ${target}: resolved path is outside /var/apps."
+          continue
+          ;;
+      esac
+
+      if ! grep -Fqx -- "$resolved_target" "$DOCKER_PHP_APP_DIRS_FILE"; then
+        printf '%s\n' "$resolved_target" >> "$DOCKER_PHP_APP_DIRS_FILE"
+        found=$((found + 1))
+        log "Docker-PHP application discovered: ${app_name} -> ${resolved_target}"
+      fi
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done
+
+  if (( found == 0 )); then
+    warn "No matching Docker-PHP application directories found under /opt/docker-apps or /opt/docker-app."
+  else
+    log "Docker-PHP FIM directories discovered: ${found}"
+  fi
+}
+
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   log "Inspecting every active Nginx virtual host and validating JSON access logs..."
   discover_brebes_waf
   log "Brebes-WAF JSON validation passed."
 else
   log "Docker-PHP endpoint profile selected."
+  log "Discovering Docker-PHP application directories under /opt/docker-apps..."
+  discover_docker_php_apps
 fi
 
 # Stage the parser only after local ModSecurity discovery has succeeded.
@@ -2176,6 +2235,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${AGENT_CONF}.pre-defenseops-${ENDPOINT_PROFILE}.${STAMP}.$$"
 TMP_AGENT_CONF="$(mktemp "${AGENT_CONF}.tmp.XXXXXX")"
 PATHS_FILE="$(mktemp)"
+[[ -n "$DOCKER_PHP_APP_DIRS_FILE" ]] || DOCKER_PHP_APP_DIRS_FILE="$(mktemp)"
 AGENT_CONFIG_REPLACED=0
 AGENT_SERVICE_STOPPED=0
 WAS_AGENT_ACTIVE=0
@@ -2223,7 +2283,7 @@ cleanup_files(){
     fi
   fi
 
-  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}" "${NGINX_DUMP:-}" "${DISCOVERY_REPORT:-}" "${MODSEC_REPORT:-}"
+  rm -f "${TMP_AGENT_CONF:-}" "${PATHS_FILE:-}" "${DOCKER_PHP_APP_DIRS_FILE:-}" "${NGINX_DUMP:-}" "${DISCOVERY_REPORT:-}" "${MODSEC_REPORT:-}"
   cleanup
   exit "$exit_code"
 }
@@ -2233,14 +2293,14 @@ trap cleanup_files EXIT
 # staging file. The original remains untouched until all pre-activation checks pass.
 cp -a -- "$AGENT_CONF" "$TMP_AGENT_CONF"
 
-python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" "$MANAGER" "$RESET_EXISTING" <<'PYMERGE'
+python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" "$MANAGER" "$RESET_EXISTING" "$DOCKER_PHP_APP_DIRS_FILE" <<'PYMERGE'
 import html
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-source, destination, profile, paths_file, expected_manager, reset_existing = sys.argv[1:7]
+source, destination, profile, paths_file, expected_manager, reset_existing, docker_php_dirs_file = sys.argv[1:8]
 original = Path(source).read_text(encoding="utf-8")
 text = original
 
@@ -2416,8 +2476,9 @@ if profile == "brebes-waf":
                     text[first.start():])
 
 elif profile == "docker-php":
-    # Docker-PHP owns only this dedicated JSONL input. No Nginx logs,
-    # global Docker logs, or unrelated container paths are added.
+    # Docker-PHP owns only its dedicated JSONL input and Compose-discovered
+    # application directories under /var/apps. No global Docker/Nginx logs
+    # or unrelated container paths are added.
     docker_php_log = "/var/log/defenseops/docker-php-events.json"
     existing = set()
     for node in parsed.iter("localfile"):
@@ -2434,6 +2495,69 @@ elif profile == "docker-php":
                 f"    <location>{docker_php_log}</location>\n"
                 "    <log_format>json</log_format>\n"
                 "  </localfile>\n" + text[insert_at:])
+
+    # Add every discovered /var/apps/<application> directory to syscheck.
+    # Preserve existing directories/options and keep this merge idempotent.
+    docker_php_dirs = []
+    for raw in Path(docker_php_dirs_file).read_text(encoding="utf-8").splitlines():
+        path = raw.strip()
+        if not path:
+            continue
+        if not path.startswith("/var/apps/") or path == "/var/apps/":
+            raise SystemExit(f"Unsafe Docker-PHP FIM path rejected: {path!r}")
+        if any(ch in path for ch in ("\x00", "\n", "\r", "\t")):
+            raise SystemExit(f"Invalid Docker-PHP FIM path rejected: {path!r}")
+        docker_php_dirs.append(path)
+
+    if docker_php_dirs:
+        watched = set()
+        for node in parsed.iter("syscheck"):
+            for directory in node.findall("directories"):
+                value = (directory.text or "").strip()
+                if value:
+                    watched.add(value)
+
+        missing_dirs = [path for path in sorted(set(docker_php_dirs)) if path not in watched]
+        if missing_dirs:
+            syscheck_match = re.search(
+                r"<syscheck\b[^>]*>.*?</syscheck\s*>",
+                text, flags=re.DOTALL
+            )
+            if syscheck_match:
+                closing = re.search(r"(?m)^([ \t]*)</syscheck\s*>", syscheck_match.group(0))
+                if not closing:
+                    raise SystemExit("Could not locate </syscheck>; refusing to modify Docker-PHP FIM settings.")
+                indent = closing.group(1)
+                insert_at = syscheck_match.start() + closing.start()
+                additions = "".join(
+                    indent + '  <directories realtime="yes">' +
+                    html.escape(path, quote=False) +
+                    '</directories>\n'
+                    for path in missing_dirs
+                )
+                text = text[:insert_at] + additions + text[insert_at:]
+            else:
+                first = re.search(r"</ossec_config\s*>", text)
+                if not first:
+                    raise SystemExit("Could not locate </ossec_config>; refusing to add Docker-PHP FIM settings.")
+                additions = (
+                    "  <syscheck>\n" +
+                    "".join(
+                        '    <directories realtime="yes">' +
+                        html.escape(path, quote=False) +
+                        '</directories>\n'
+                        for path in missing_dirs
+                    ) +
+                    "  </syscheck>\n"
+                )
+                text = text[:first.start()] + additions + text[first.start():]
+            for path in missing_dirs:
+                print(f"[INFO] Added Docker-PHP FIM directory: {path}")
+        else:
+            print("[INFO] All discovered Docker-PHP application directories are already monitored by FIM.")
+    else:
+        print("[INFO] No Docker-PHP application directories were discovered; no FIM directory was added.")
+
 try:
     ET.fromstring("<defenseops_validation_root>" +
                   re.sub(r"^\s*<\?xml[^?]*\?>", "", text, count=1) +
@@ -2717,7 +2841,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (registry-scoped collector v1.9.1)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.9.1 + Compose-discovered /var/apps FIM)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
