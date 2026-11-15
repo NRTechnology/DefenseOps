@@ -2085,7 +2085,7 @@ finalize_manager_and_verify_archives() {
         logs="$(docker logs --since "$restart_time" "$manager_id" 2>&1 || true)"
 
         if printf '%s\n' "$logs" |
-            grep -E 'Enabled modules/filesets: wazuh \(archives, alerts\)|Enabled modules/filesets: wazuh \(alerts, archives\)' >/dev/null; then
+            grep -E 'Enabled modules/filesets:.*wazuh \([^)]*(alerts.*archives|archives.*alerts)[^)]*\)' >/dev/null; then
             filebeat_ready=1
         fi
 
