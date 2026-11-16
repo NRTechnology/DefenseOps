@@ -48,6 +48,7 @@ readonly GEOIP_PIPELINE="defenseops-brebes-waf-geoip"
 LOG_FILE="${LOG_FILE:-/var/log/defenseops-install-requirements.log}"
 DRY_RUN=0
 REPAIR_ARCHIVES_ONLY=0
+EXISTING_DEPLOYMENT=0
 
 # Populated by finalize_manager_and_verify_archives() and displayed in summary.
 SUMMARY_GROUP_BREBES_WAF="NOT VERIFIED"
@@ -75,6 +76,7 @@ Usage: sudo ./$SCRIPT_NAME [options]
 Options:
   --dry-run       Check requirements and show the installation plan only.
   --repair-archives-only  Repair persistent Filebeat archives config only; do not redeploy Wazuh.
+  --allow-existing-deployment  Paksa full deployment meski instalasi sudah ada (berisiko; bukan mode update).
   -h, --help      Show this help.
 
 Environment:
@@ -93,6 +95,7 @@ while (($#)); do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --repair-archives-only) REPAIR_ARCHIVES_ONLY=1 ;;
+        --allow-existing-deployment) EXISTING_DEPLOYMENT=1 ;;
         -h|--help) usage; exit 0 ;;
         *) die "Opsi tidak dikenal: $1 (gunakan --help)." ;;
     esac
@@ -2109,10 +2112,10 @@ PYMMDB
     chown 1000:1000 "$GEOIP_DIR"/DefenseOps-*.mmdb
     chmod 0640 "$GEOIP_DIR"/DefenseOps-*.mmdb
 
+    # Install/update unit definitions without changing an existing timer's
+    # enabled/active state. A fresh install enables it only after the pipeline
+    # and Indexer checks have completed successfully in deploy_wazuh().
     install_geoip_updater_service
-    # The timer remains disabled until the operator validates the pipeline
-    # against the currently running Indexer and deliberately enables updates.
-    systemctl disable --now defenseops-geoip-update.timer >/dev/null 2>&1 || true
     if (( changed )); then
         touch "${GEOIP_DIR}/.indexer-reload-required"
         chown 1000:1000 "${GEOIP_DIR}/.indexer-reload-required"
@@ -2216,8 +2219,8 @@ Persistent=true
 WantedBy=timers.target
 GEOIPTIMER
     systemctl daemon-reload
-    # Timer intentionally remains disabled until the operator validates
-    # GeoIP enrichment against the running Indexer and enables it manually.
+    # Do not enable/disable the timer here. deploy_wazuh() enables it only
+    # after the initial GeoIP pipeline has been installed and verified.
 }
 
 configure_geoip_pipeline() {
@@ -2226,24 +2229,40 @@ configure_geoip_pipeline() {
 {
  "description":"DefenseOps GeoIP enrichment for Brebes-WAF events",
  "processors":[
-  {"script":{"if":"ctx.data != null","source":"if (ctx.data.srcip != null && ctx.data.srcip.toString().length() > 0) { ctx._defenseops_geoip_ip = ctx.data.srcip; } else if (ctx.data.client != null && ctx.data.client.ip != null) { ctx._defenseops_geoip_ip = ctx.data.client.ip; }"}},
-  {"geoip":{"if":"ctx._defenseops_geoip_ip != null","field":"_defenseops_geoip_ip","target_field":"GeoLocation","database_file":"DefenseOps-City.mmdb","properties":["city_name","country_name","region_name","location"],"ignore_missing":true,"ignore_failure":true}},
-  {"remove":{"field":"_defenseops_geoip_ip","ignore_missing":true}}
+  {"script":{"if":"ctx.data != null && ctx.data.integration == 'brebes-waf'","source":"if (ctx.data.srcip != null && ctx.data.srcip.toString().length() > 0) { ctx._defenseops_geoip_ip = ctx.data.srcip; } else if (ctx.data.client != null && ctx.data.client.ip != null) { ctx._defenseops_geoip_ip = ctx.data.client.ip; }"}},
+  {"geoip":{"if":"ctx.data != null && ctx.data.integration == 'brebes-waf' && ctx._defenseops_geoip_ip != null","field":"_defenseops_geoip_ip","target_field":"GeoLocation","database_file":"DefenseOps-City.mmdb","properties":["city_name","country_name","region_name","location"],"ignore_missing":true,"ignore_failure":true}},
+  {"remove":{"if":"ctx.data != null && ctx.data.integration == 'brebes-waf'","field":"_defenseops_geoip_ip","ignore_missing":true}}
  ]
 }
 PIPELINE
     curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -H 'Content-Type: application/json' -X PUT "https://127.0.0.1:9200/_ingest/pipeline/${GEOIP_PIPELINE}" --data-binary "@${payload}" >/dev/null || { rm -f "$payload"; die "Gagal memasang GeoIP pipeline."; }
     rm -f "$payload"
-    # Apply the pipeline only to existing alert indices. We deliberately do not
-    # create a competing high-priority composable template that could shadow
-    # Wazuh's own mappings/settings template.
-    local indices index
+    # Legacy index template applies only to future Wazuh Alerts indices.
+    # It adds a single setting and does not redefine mappings or touch archives.
+    # Wazuh deployments using a matching composable template may take precedence;
+    # existing alert indices are therefore configured individually below too.
+    local template_payload indices index
+    template_payload="$(mktemp)"
+    jq -n --arg pipeline "$GEOIP_PIPELINE" \
+        '{index_patterns:["wazuh-alerts-4.x-*"],order:100,settings:{"index.final_pipeline":$pipeline}}' \
+        > "$template_payload"
+    curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
+        -H 'Content-Type: application/json' -X PUT \
+        "https://127.0.0.1:9200/_template/defenseops-brebes-waf-geoip" \
+        --data-binary "@${template_payload}" >/dev/null \
+        || { rm -f "$template_payload"; die "Gagal memasang template GeoIP untuk indeks Alerts mendatang."; }
+    rm -f "$template_payload"
+
     indices="$(curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" 'https://127.0.0.1:9200/_cat/indices/wazuh-alerts-4.x-*?h=index' 2>/dev/null || true)"
     while IFS= read -r index; do
         [[ -n "$index" ]] || continue
-        curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -H 'Content-Type: application/json' -X PUT "https://127.0.0.1:9200/${index}/_settings" -d "{\"index.final_pipeline\":\"${GEOIP_PIPELINE}\"}" >/dev/null || warn "Gagal memasang final_pipeline pada ${index}."
+        curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" \
+            -H 'Content-Type: application/json' -X PUT \
+            "https://127.0.0.1:9200/${index}/_settings" \
+            -d "{\\"index.final_pipeline\\":\\"${GEOIP_PIPELINE}\\"}" >/dev/null \
+            || die "Gagal memasang final_pipeline pada indeks Alerts ${index}."
     done <<< "$indices"
-    ok "GeoIP pipeline ${GEOIP_PIPELINE} dipasang."
+    ok "GeoIP pipeline dan template Alerts ${GEOIP_PIPELINE} dipasang; Archives tidak disentuh."
 }
 
 deploy_wazuh() {
@@ -2274,6 +2293,12 @@ deploy_wazuh() {
     compose_up indexer
     wait_for_indexer
     configure_geoip_pipeline
+    # Fresh install: schedule daily GeoLite2 checks only after the Indexer API
+    # accepted the Brebes-WAF-only pipeline and the alert template.
+    systemctl enable --now defenseops-geoip-update.timer
+    systemctl is-enabled --quiet defenseops-geoip-update.timer \
+        || die "GeoIP updater timer gagal di-enable."
+    ok "GeoIP updater timer aktif dan enabled."
     configure_indexer_retention_policies
 
     log "Menjalankan Wazuh Manager..."
@@ -2659,6 +2684,16 @@ main() {
     log "===== DefenseOps Full Requirements & Wazuh Installer ====="
     check_system_requirements
 
+    # This script is a fresh-install workflow, not a general upgrade routine.
+    # Never let a normal invocation reconcile Compose files or restart live
+    # services on an existing host by accident.
+    if (( ! DRY_RUN && ! EXISTING_DEPLOYMENT )); then
+        if [[ -d "$WAZUH_ROOT" ]] || \
+           docker ps -aq --filter 'label=com.defenseops.managed=true' | grep -q .; then
+            die "Deployment DefenseOps sudah terdeteksi. Untuk melindungi instalasi yang berjalan, full installer dihentikan. Gunakan --repair-archives-only untuk perbaikan archives; jangan gunakan --allow-existing-deployment kecuali memang merencanakan redeploy penuh."
+        fi
+    fi
+
     if (( DRY_RUN )); then
         echo
         log "DRY-RUN: tidak ada perubahan yang diterapkan."
@@ -2673,7 +2708,7 @@ main() {
         log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
         log "Custom alert rules Brebes-WAF: install idempotent 100500-100506 ke volume Manager; validasi analysisd; tanpa restart tambahan."
         log "Custom alert rules Docker-PHP: install idempotent 100600-100603, 100610, 100620-100621 ke file terpisah pada volume Manager; validasi analysisd; tanpa restart tambahan."
-        log "GeoLite2: MaxMind credentials -> DefenseOps-City/Country/ASN.mmdb -> read-only Indexer mount -> GeoIP pipeline -> daily updater installed but timer disabled pending validation."
+        log "GeoLite2: MaxMind credentials -> staged/validated DefenseOps-City/Country/ASN.mmdb -> read-only Indexer mount -> Brebes-WAF-only GeoIP pipeline -> Alerts template + existing Alerts indices -> daily updater timer enabled after pipeline installation; Archives excluded."
         exit 0
     fi
 
