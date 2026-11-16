@@ -2077,9 +2077,15 @@ PYMMDB
         fi
     done
     rmdir "$backup_dir" 2>/dev/null || true
-    rm -rf "$staging"; chmod 0644 "$GEOIP_DIR"/*.mmdb
+    rm -rf "$staging"
+    # The Indexer process runs as UID/GID 1000. It must be able to traverse
+    # the read-only bind mount and read every MMDB file during startup.
+    chown 1000:1000 "$GEOIP_DIR"
+    chmod 0750 "$GEOIP_DIR"
+    chown 1000:1000 "$GEOIP_DIR"/*.mmdb
+    chmod 0640 "$GEOIP_DIR"/*.mmdb
     install_geoip_updater_service
-    ok "GeoLite2 City, Country, dan ASN tervalidasi dan tersedia."
+    ok "GeoLite2 City, Country, dan ASN tervalidasi; permission UID/GID 1000 diterapkan."
 }
 
 install_geoip_updater_service() {
@@ -2088,7 +2094,8 @@ install_geoip_updater_service() {
 set -Eeuo pipefail
 ROOT="${DEFENSEOPS_ROOT:-/opt/defenseops}"; DB="${ROOT}/geoip"; CONF="${ROOT}/secrets/geoipupdate.conf"; BACKUP="${ROOT}/geoip-backup"
 [[ -s "$CONF" ]] || exit 1
-STAGE="$(mktemp -d "${DB}/.staging.XXXXXX")"; TMP="$(mktemp "${ROOT}/secrets/.geoipupdate.XXXXXX")"
+install -d -m 0700 "${ROOT}/geoip-update-staging"
+STAGE="$(mktemp -d "${ROOT}/geoip-update-staging/.staging.XXXXXX")"; TMP="$(mktemp "${ROOT}/secrets/.geoipupdate.XXXXXX")"
 trap 'rm -rf "$STAGE"; rm -f "$TMP"' EXIT
 awk -v dir="$STAGE" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$CONF" > "$TMP"; chmod 0600 "$TMP"
 geoipupdate -f "$TMP"
@@ -2108,8 +2115,15 @@ for n in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
  if [[ ! -s "${DB}/${n}" ]] || ! cmp -s "${STAGE}/${n}" "${DB}/${n}"; then install -m 0644 "${STAGE}/${n}" "${DB}/.${n}.new"; mv -f "${DB}/.${n}.new" "${DB}/${n}"; changed=1; fi
 done
 rmdir "$B" 2>/dev/null || true
+# Keep the mounted directory readable/traversable by the Indexer identity.
+chown 1000:1000 "$DB"
+chmod 0750 "$DB"
+chown 1000:1000 "$DB"/*.mmdb
+chmod 0640 "$DB"/*.mmdb
 if (( changed )); then
  touch "${DB}/.indexer-reload-required"
+ chown 1000:1000 "${DB}/.indexer-reload-required"
+ chmod 0640 "${DB}/.indexer-reload-required"
  echo "GeoLite2 changed; marker .indexer-reload-required created. Schedule an Indexer restart to reload the custom MMDB files."
 else
  echo "GeoLite2 is current."
@@ -2179,6 +2193,13 @@ deploy_wazuh() {
 
     load_or_create_credentials
     prompt_and_configure_geoip
+    # Reassert ownership/modes on every deployment run before Indexer starts.
+    chown 1000:1000 "$GEOIP_DIR"
+    chmod 0750 "$GEOIP_DIR"
+    if compgen -G "$GEOIP_DIR/*.mmdb" >/dev/null; then
+        chown 1000:1000 "$GEOIP_DIR"/*.mmdb
+        chmod 0640 "$GEOIP_DIR"/*.mmdb
+    fi
     secure_indexer_internal_users
     prepare_wazuh_config_permissions
     generate_split_compose_files
