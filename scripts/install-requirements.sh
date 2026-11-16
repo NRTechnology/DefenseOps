@@ -2050,83 +2050,148 @@ prompt_and_configure_geoip() {
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y geoipupdate
     fi
-    local staging config_tmp db backup_dir timestamp
-    staging="$(mktemp -d "${GEOIP_DIR}/.staging.XXXXXX")"
+    local staging config_tmp backup_dir timestamp source_name target_name changed=0
+    staging="$(mktemp -d "${DEFENSEOPS_ROOT}/.geoip-install-staging.XXXXXX")"
     config_tmp="$(mktemp "${GEOIP_SECRET_DIR}/.geoipupdate-stage.XXXXXX")"
     awk -v dir="$staging" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$GEOIP_CONFIG_FILE" > "$config_tmp"
     chmod 0600 "$config_tmp"
-    if ! geoipupdate -f "$config_tmp"; then rm -rf "$staging" "$config_tmp"; die "Download GeoLite2 gagal; database aktif tidak diubah."; fi
+    if ! geoipupdate -f "$config_tmp"; then
+        rm -rf "$staging"; rm -f "$config_tmp"
+        die "Download GeoLite2 gagal; database aktif tidak diubah."
+    fi
     rm -f "$config_tmp"
+
+    # geoipupdate emits MaxMind's standard filenames. Validate those files,
+    # then install them under DefenseOps-specific names because OpenSearch
+    # reserves GeoLite2-*.mmdb names in its custom database directory.
     python3 - "$staging" <<'PYMMDB'
 import sys
 from pathlib import Path
-root=Path(sys.argv[1]); marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
+root=Path(sys.argv[1])
+marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
 for name in ("GeoLite2-City.mmdb","GeoLite2-Country.mmdb","GeoLite2-ASN.mmdb"):
- p=root/name
- if not p.is_file() or p.stat().st_size < 1024: raise SystemExit(f"Database tidak lengkap: {name}")
- with p.open("rb") as f: f.seek(max(0,p.stat().st_size-131072)); tail=f.read()
- if marker not in tail: raise SystemExit(f"Metadata MMDB tidak valid: {name}")
- print(f"Validated {name}: {p.stat().st_size} bytes")
+    p=root/name
+    if not p.is_file() or p.stat().st_size < 1024:
+        raise SystemExit(f"Database tidak lengkap: {name}")
+    with p.open("rb") as f:
+        f.seek(max(0,p.stat().st_size-131072)); tail=f.read()
+    if marker not in tail:
+        raise SystemExit(f"Metadata MMDB tidak valid: {name}")
+    print(f"Validated {name}: {p.stat().st_size} bytes")
 PYMMDB
-    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup_dir="${DEFENSEOPS_ROOT}/geoip-backup/${timestamp}"
+
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_dir="${DEFENSEOPS_ROOT}/geoip-backup/${timestamp}"
     install -d -m 0750 "$backup_dir"
-    for db in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
-        if [[ -s "${GEOIP_DIR}/${db}" ]] && ! cmp -s "${staging}/${db}" "${GEOIP_DIR}/${db}"; then cp -a "${GEOIP_DIR}/${db}" "$backup_dir/"; fi
-        if [[ ! -s "${GEOIP_DIR}/${db}" ]] || ! cmp -s "${staging}/${db}" "${GEOIP_DIR}/${db}"; then
-            install -m 0644 "${staging}/${db}" "${GEOIP_DIR}/.${db}.new"; mv -f "${GEOIP_DIR}/.${db}.new" "${GEOIP_DIR}/${db}"
+    for source_name in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
+        case "$source_name" in
+            GeoLite2-City.mmdb) target_name="DefenseOps-City.mmdb" ;;
+            GeoLite2-Country.mmdb) target_name="DefenseOps-Country.mmdb" ;;
+            GeoLite2-ASN.mmdb) target_name="DefenseOps-ASN.mmdb" ;;
+        esac
+        if [[ -s "${GEOIP_DIR}/${target_name}" ]] && ! cmp -s "${staging}/${source_name}" "${GEOIP_DIR}/${target_name}"; then
+            cp -a "${GEOIP_DIR}/${target_name}" "$backup_dir/"
+        fi
+        if [[ ! -s "${GEOIP_DIR}/${target_name}" ]] || ! cmp -s "${staging}/${source_name}" "${GEOIP_DIR}/${target_name}"; then
+            install -m 0640 "${staging}/${source_name}" "${GEOIP_DIR}/.${target_name}.new"
+            chown 1000:1000 "${GEOIP_DIR}/.${target_name}.new"
+            mv -f "${GEOIP_DIR}/.${target_name}.new" "${GEOIP_DIR}/${target_name}"
+            changed=1
         fi
     done
     rmdir "$backup_dir" 2>/dev/null || true
     rm -rf "$staging"
-    # The Indexer process runs as UID/GID 1000. It must be able to traverse
-    # the read-only bind mount and read every MMDB file during startup.
+
+    # The Indexer process runs as UID/GID 1000. Keep the bind mount traversable
+    # and MMDB files readable without granting world access.
     chown 1000:1000 "$GEOIP_DIR"
     chmod 0750 "$GEOIP_DIR"
-    chown 1000:1000 "$GEOIP_DIR"/*.mmdb
-    chmod 0640 "$GEOIP_DIR"/*.mmdb
+    chown 1000:1000 "$GEOIP_DIR"/DefenseOps-*.mmdb
+    chmod 0640 "$GEOIP_DIR"/DefenseOps-*.mmdb
+
     install_geoip_updater_service
-    ok "GeoLite2 City, Country, dan ASN tervalidasi; permission UID/GID 1000 diterapkan."
+    # The timer remains disabled until the operator validates the pipeline
+    # against the currently running Indexer and deliberately enables updates.
+    systemctl disable --now defenseops-geoip-update.timer >/dev/null 2>&1 || true
+    if (( changed )); then
+        touch "${GEOIP_DIR}/.indexer-reload-required"
+        chown 1000:1000 "${GEOIP_DIR}/.indexer-reload-required"
+        chmod 0640 "${GEOIP_DIR}/.indexer-reload-required"
+        warn "Database GeoIP berubah; Indexer perlu restart terencana untuk memuat MMDB baru."
+    fi
+    ok "GeoLite2 terpasang sebagai DefenseOps-City/Country/ASN.mmdb; permission UID/GID 1000 diterapkan."
 }
 
 install_geoip_updater_service() {
     cat > "$GEOIP_UPDATER" <<'GEOIPUPDATER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-ROOT="${DEFENSEOPS_ROOT:-/opt/defenseops}"; DB="${ROOT}/geoip"; CONF="${ROOT}/secrets/geoipupdate.conf"; BACKUP="${ROOT}/geoip-backup"
-[[ -s "$CONF" ]] || exit 1
-install -d -m 0700 "${ROOT}/geoip-update-staging"
-STAGE="$(mktemp -d "${ROOT}/geoip-update-staging/.staging.XXXXXX")"; TMP="$(mktemp "${ROOT}/secrets/.geoipupdate.XXXXXX")"
+ROOT="${DEFENSEOPS_ROOT:-/opt/defenseops}"
+DB="${ROOT}/geoip"
+CONF="${ROOT}/secrets/geoipupdate.conf"
+BACKUP="${ROOT}/geoip-backup"
+STAGING_ROOT="${ROOT}/geoip-update-staging"
+[[ -s "$CONF" ]] || { echo "MaxMind config not found: $CONF" >&2; exit 1; }
+command -v geoipupdate >/dev/null 2>&1 || { echo "geoipupdate command not found" >&2; exit 1; }
+install -d -m 0700 "$STAGING_ROOT" "${ROOT}/secrets"
+STAGE="$(mktemp -d "${STAGING_ROOT}/.staging.XXXXXX")"
+TMP="$(mktemp "${ROOT}/secrets/.geoipupdate.XXXXXX")"
 trap 'rm -rf "$STAGE"; rm -f "$TMP"' EXIT
-awk -v dir="$STAGE" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$CONF" > "$TMP"; chmod 0600 "$TMP"
+awk -v dir="$STAGE" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$CONF" > "$TMP"
+chmod 0600 "$TMP"
 geoipupdate -f "$TMP"
+
+# Validate all three staged databases before changing any active database.
 python3 - "$STAGE" <<'PY'
 import sys
 from pathlib import Path
-r=Path(sys.argv[1]); marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
-for n in ("GeoLite2-City.mmdb","GeoLite2-Country.mmdb","GeoLite2-ASN.mmdb"):
- p=r/n
- if not p.is_file() or p.stat().st_size<1024: raise SystemExit(f"Missing {n}")
- with p.open("rb") as f: f.seek(max(0,p.stat().st_size-131072)); b=f.read()
- if marker not in b: raise SystemExit(f"Invalid {n}")
+root=Path(sys.argv[1])
+marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
+for name in ("GeoLite2-City.mmdb","GeoLite2-Country.mmdb","GeoLite2-ASN.mmdb"):
+    p=root/name
+    if not p.is_file() or p.stat().st_size < 1024:
+        raise SystemExit(f"Missing or incomplete database: {name}")
+    with p.open("rb") as f:
+        f.seek(max(0,p.stat().st_size-131072)); tail=f.read()
+    if marker not in tail:
+        raise SystemExit(f"Invalid MaxMind metadata: {name}")
 PY
-TS="$(date -u +%Y%m%dT%H%M%SZ)"; B="${BACKUP}/${TS}"; install -d -m 0750 "$B"; changed=0
-for n in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
- if [[ -s "${DB}/${n}" ]] && ! cmp -s "${STAGE}/${n}" "${DB}/${n}"; then cp -a "${DB}/${n}" "$B/"; fi
- if [[ ! -s "${DB}/${n}" ]] || ! cmp -s "${STAGE}/${n}" "${DB}/${n}"; then install -m 0644 "${STAGE}/${n}" "${DB}/.${n}.new"; mv -f "${DB}/.${n}.new" "${DB}/${n}"; changed=1; fi
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+B="${BACKUP}/${TS}"
+install -d -m 0750 "$B"
+changed=0
+for source in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
+    case "$source" in
+        GeoLite2-City.mmdb) target="DefenseOps-City.mmdb" ;;
+        GeoLite2-Country.mmdb) target="DefenseOps-Country.mmdb" ;;
+        GeoLite2-ASN.mmdb) target="DefenseOps-ASN.mmdb" ;;
+    esac
+    if [[ -s "${DB}/${target}" ]] && ! cmp -s "${STAGE}/${source}" "${DB}/${target}"; then
+        cp -a "${DB}/${target}" "$B/"
+    fi
+    if [[ ! -s "${DB}/${target}" ]] || ! cmp -s "${STAGE}/${source}" "${DB}/${target}"; then
+        install -m 0640 "${STAGE}/${source}" "${DB}/.${target}.new"
+        chown 1000:1000 "${DB}/.${target}.new"
+        mv -f "${DB}/.${target}.new" "${DB}/${target}"
+        changed=1
+    fi
 done
 rmdir "$B" 2>/dev/null || true
-# Keep the mounted directory readable/traversable by the Indexer identity.
+
+# Enforce the same least-privilege permissions used by the Indexer container.
 chown 1000:1000 "$DB"
 chmod 0750 "$DB"
-chown 1000:1000 "$DB"/*.mmdb
-chmod 0640 "$DB"/*.mmdb
+chown 1000:1000 "$DB"/DefenseOps-*.mmdb
+chmod 0640 "$DB"/DefenseOps-*.mmdb
+
 if (( changed )); then
- touch "${DB}/.indexer-reload-required"
- chown 1000:1000 "${DB}/.indexer-reload-required"
- chmod 0640 "${DB}/.indexer-reload-required"
- echo "GeoLite2 changed; marker .indexer-reload-required created. Schedule an Indexer restart to reload the custom MMDB files."
+    touch "${DB}/.indexer-reload-required"
+    chown 1000:1000 "${DB}/.indexer-reload-required"
+    chmod 0640 "${DB}/.indexer-reload-required"
+    echo "GeoLite2 databases changed; .indexer-reload-required created. Restart Indexer manually during a maintenance window."
 else
- echo "GeoLite2 is current."
+    echo "GeoLite2 databases are current; no Indexer restart is required."
 fi
 GEOIPUPDATER
     chmod 0750 "$GEOIP_UPDATER"
@@ -2151,8 +2216,8 @@ Persistent=true
 WantedBy=timers.target
 GEOIPTIMER
     systemctl daemon-reload
-    systemctl enable defenseops-geoip-update.timer
-    systemctl start defenseops-geoip-update.timer
+    # Timer intentionally remains disabled until the operator validates
+    # GeoIP enrichment against the running Indexer and enables it manually.
 }
 
 configure_geoip_pipeline() {
@@ -2162,7 +2227,7 @@ configure_geoip_pipeline() {
  "description":"DefenseOps GeoIP enrichment for Brebes-WAF events",
  "processors":[
   {"script":{"if":"ctx.data != null","source":"if (ctx.data.srcip != null && ctx.data.srcip.toString().length() > 0) { ctx._defenseops_geoip_ip = ctx.data.srcip; } else if (ctx.data.client != null && ctx.data.client.ip != null) { ctx._defenseops_geoip_ip = ctx.data.client.ip; }"}},
-  {"geoip":{"if":"ctx._defenseops_geoip_ip != null","field":"_defenseops_geoip_ip","target_field":"GeoLocation","database_file":"GeoLite2-City.mmdb","properties":["city_name","country_name","region_name","location"],"ignore_missing":true,"ignore_failure":true}},
+  {"geoip":{"if":"ctx._defenseops_geoip_ip != null","field":"_defenseops_geoip_ip","target_field":"GeoLocation","database_file":"DefenseOps-City.mmdb","properties":["city_name","country_name","region_name","location"],"ignore_missing":true,"ignore_failure":true}},
   {"remove":{"field":"_defenseops_geoip_ip","ignore_missing":true}}
  ]
 }
@@ -2509,11 +2574,11 @@ print_installation_summary() {
     printf '\n%b[ GEOIP / GEOLITE2 ]%b\n' "$BLUE" "$NC"
     printf 'Database Directory    : %s\n' "$GEOIP_DIR"
     printf 'MaxMind Config        : %s (permission 0600)\n' "$GEOIP_CONFIG_FILE"
-    printf 'City Database        : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-City.mmdb" && printf OK || printf MISSING)"
-    printf 'Country Database     : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-Country.mmdb" && printf OK || printf MISSING)"
-    printf 'ASN Database         : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-ASN.mmdb" && printf OK || printf MISSING)"
+    printf 'City Database        : %s\n' "$(test -s "${GEOIP_DIR}/DefenseOps-City.mmdb" && printf OK || printf MISSING)"
+    printf 'Country Database     : %s\n' "$(test -s "${GEOIP_DIR}/DefenseOps-Country.mmdb" && printf OK || printf MISSING)"
+    printf 'ASN Database         : %s\n' "$(test -s "${GEOIP_DIR}/DefenseOps-ASN.mmdb" && printf OK || printf MISSING)"
     printf 'Ingest Pipeline      : %s\n' "$GEOIP_PIPELINE"
-    printf 'Auto Update          : %s\n' "$(systemctl is-enabled defenseops-geoip-update.timer 2>/dev/null || printf NOT CONFIGURED)"
+    printf 'Auto Update          : %s\n' "$(systemctl is-enabled defenseops-geoip-update.timer 2>/dev/null || printf 'DISABLED - pending validation')"
     printf '\n%b[ FILEBEAT ARCHIVES ]%b\n' "$BLUE" "$NC"
     printf 'Filebeat Alerts       : %s\n' "$SUMMARY_FILEBEAT_ALERTS"
     printf 'Filebeat Archives     : %s\n' "$SUMMARY_FILEBEAT_ARCHIVES"
@@ -2608,7 +2673,7 @@ main() {
         log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
         log "Custom alert rules Brebes-WAF: install idempotent 100500-100506 ke volume Manager; validasi analysisd; tanpa restart tambahan."
         log "Custom alert rules Docker-PHP: install idempotent 100600-100603, 100610, 100620-100621 ke file terpisah pada volume Manager; validasi analysisd; tanpa restart tambahan."
-        log "GeoLite2: MaxMind credentials -> City/Country/ASN -> read-only Indexer mount -> GeoIP pipeline -> daily systemd timer."
+        log "GeoLite2: MaxMind credentials -> DefenseOps-City/Country/ASN.mmdb -> read-only Indexer mount -> GeoIP pipeline -> daily updater installed but timer disabled pending validation."
         exit 0
     fi
 
