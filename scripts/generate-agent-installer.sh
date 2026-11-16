@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.13
-# Release     : 2026-11-15
+# Version     : 1.8.15
+# Release     : 2026-11-16
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.14"
+SCRIPT_VERSION="1.8.15"
 SCRIPT_RELEASE="2026-11-15"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.14"
+INSTALLER_VERSION="1.8.15"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -1231,6 +1231,7 @@ def parse_audit(path: Path, hostname: str) -> Iterator[dict]:
             'timestamp': timestamp,
             'hostname': hostname,
             'transaction_id': first(meta, 'unique_id', txid),
+            'srcip': client_ip,
             'client': {'ip': client_ip},
             'request': {
                 'method': method,
