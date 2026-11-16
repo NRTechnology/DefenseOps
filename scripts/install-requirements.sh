@@ -39,6 +39,11 @@ readonly DOCKER_SOURCES_FILE="/etc/apt/sources.list.d/docker.sources"
 readonly UBUNTU_SOURCES_FILE="/etc/apt/sources.list.d/ubuntu.sources"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-defenseops-wazuh.conf"
 readonly CREDENTIALS_FILE="${DEFENSEOPS_ROOT}/secrets/wazuh-credentials.env"
+readonly GEOIP_DIR="${DEFENSEOPS_ROOT}/geoip"
+readonly GEOIP_SECRET_DIR="${DEFENSEOPS_ROOT}/secrets"
+readonly GEOIP_CONFIG_FILE="${GEOIP_SECRET_DIR}/geoipupdate.conf"
+readonly GEOIP_UPDATER="${DEFENSEOPS_ROOT}/core/services/defenseops-geoip-update.sh"
+readonly GEOIP_PIPELINE="defenseops-brebes-waf-geoip"
 
 LOG_FILE="${LOG_FILE:-/var/log/defenseops-install-requirements.log}"
 DRY_RUN=0
@@ -387,7 +392,9 @@ create_directories() {
         "${WAZUH_ROOT}/dashboard/logs" \
         "${WAZUH_SHARED}" \
         "${DEFENSEOPS_ROOT}/backup" \
-        "${DEFENSEOPS_ROOT}/secrets"
+        "${DEFENSEOPS_ROOT}/secrets" \
+        "${GEOIP_DIR}" \
+        "${DEFENSEOPS_ROOT}/geoip-backup"
     chmod 0700 "${DEFENSEOPS_ROOT}/secrets"
     ok "Direktori DefenseOps tersedia."
 }
@@ -1234,6 +1241,29 @@ for component, (service_name, out_dir, project) in targets.items():
         print(f"Created {out_file}")
 PY
 
+    INDEXER_COMPOSE_FILE="${WAZUH_ROOT}/indexer/docker-compose.yml" GEOIP_HOST_DIR="${GEOIP_DIR}" python3 <<'PYGEOIPCOMPOSE'
+import os, shutil, tempfile
+from pathlib import Path
+import yaml
+p=Path(os.environ["INDEXER_COMPOSE_FILE"]); doc=yaml.safe_load(p.read_text())
+s=doc["services"]["wazuh.indexer"]; v=s.setdefault("volumes",[])
+src=os.environ["GEOIP_HOST_DIR"]; dst="/usr/share/wazuh-indexer/config/ingest-geoip"
+found=False
+for item in v:
+ if isinstance(item,str) and item.split(":")[1:2]==[dst]:
+  if item != f"{src}:{dst}:ro": raise SystemExit("GeoIP mount conflict; refusing to overwrite.")
+  found=True
+if not found:
+ backup=p.with_name(p.name+".pre-geoip-backup")
+ if not backup.exists(): shutil.copy2(p,backup)
+ v.append(f"{src}:{dst}:ro")
+ fd,tmp=tempfile.mkstemp(dir=str(p.parent),prefix=p.name+".")
+ with os.fdopen(fd,"w") as f: yaml.safe_dump(doc,f,sort_keys=False)
+ os.chmod(tmp,0o640); os.replace(tmp,p)
+ print("GeoIP read-only mount added to Indexer Compose.")
+else: print("GeoIP read-only mount already configured.")
+PYGEOIPCOMPOSE
+
     # Per-project Compose interpolation files. Passwords contain only hex and
     # a short suffix, so no dotenv escaping is required.
     cat > "${WAZUH_ROOT}/manager/.env" <<ENV
@@ -1998,6 +2028,145 @@ PYDOCKERPHPRULES
 
 
 
+prompt_and_configure_geoip() {
+    log "Menyiapkan GeoLite2 dari MaxMind..."
+    install -d -m 0750 "$GEOIP_DIR" "${DEFENSEOPS_ROOT}/geoip-backup" "$GEOIP_SECRET_DIR"
+    chmod 0700 "$GEOIP_SECRET_DIR"
+    if [[ ! -s "$GEOIP_CONFIG_FILE" ]]; then
+        local account_id license_key tmp_config
+        read -r -p "MaxMind Account ID: " account_id
+        [[ -n "$account_id" ]] || die "MaxMind Account ID tidak boleh kosong."
+        read -r -s -p "MaxMind License Key: " license_key; printf '\n'
+        [[ -n "$license_key" ]] || die "MaxMind License Key tidak boleh kosong."
+        tmp_config="$(mktemp "${GEOIP_SECRET_DIR}/.geoipupdate.XXXXXX")"
+        printf 'AccountID %s\nLicenseKey %s\nEditionIDs GeoLite2-City GeoLite2-Country GeoLite2-ASN\nDatabaseDirectory %s\nPreserveFileTimes 1\nRetryFor 5m\n' "$account_id" "$license_key" "$GEOIP_DIR" > "$tmp_config"
+        chmod 0600 "$tmp_config"; mv -f "$tmp_config" "$GEOIP_CONFIG_FILE"
+        unset license_key
+    else
+        chmod 0600 "$GEOIP_CONFIG_FILE"
+        log "Kredensial MaxMind yang sudah ada dipertahankan."
+    fi
+    if ! command -v geoipupdate >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y geoipupdate
+    fi
+    local staging config_tmp db backup_dir timestamp
+    staging="$(mktemp -d "${GEOIP_DIR}/.staging.XXXXXX")"
+    config_tmp="$(mktemp "${GEOIP_SECRET_DIR}/.geoipupdate-stage.XXXXXX")"
+    awk -v dir="$staging" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$GEOIP_CONFIG_FILE" > "$config_tmp"
+    chmod 0600 "$config_tmp"
+    if ! geoipupdate -f "$config_tmp"; then rm -rf "$staging" "$config_tmp"; die "Download GeoLite2 gagal; database aktif tidak diubah."; fi
+    rm -f "$config_tmp"
+    python3 - "$staging" <<'PYMMDB'
+import sys
+from pathlib import Path
+root=Path(sys.argv[1]); marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
+for name in ("GeoLite2-City.mmdb","GeoLite2-Country.mmdb","GeoLite2-ASN.mmdb"):
+ p=root/name
+ if not p.is_file() or p.stat().st_size < 1024: raise SystemExit(f"Database tidak lengkap: {name}")
+ with p.open("rb") as f: f.seek(max(0,p.stat().st_size-131072)); tail=f.read()
+ if marker not in tail: raise SystemExit(f"Metadata MMDB tidak valid: {name}")
+ print(f"Validated {name}: {p.stat().st_size} bytes")
+PYMMDB
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup_dir="${DEFENSEOPS_ROOT}/geoip-backup/${timestamp}"
+    install -d -m 0750 "$backup_dir"
+    for db in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
+        if [[ -s "${GEOIP_DIR}/${db}" ]] && ! cmp -s "${staging}/${db}" "${GEOIP_DIR}/${db}"; then cp -a "${GEOIP_DIR}/${db}" "$backup_dir/"; fi
+        if [[ ! -s "${GEOIP_DIR}/${db}" ]] || ! cmp -s "${staging}/${db}" "${GEOIP_DIR}/${db}"; then
+            install -m 0644 "${staging}/${db}" "${GEOIP_DIR}/.${db}.new"; mv -f "${GEOIP_DIR}/.${db}.new" "${GEOIP_DIR}/${db}"
+        fi
+    done
+    rmdir "$backup_dir" 2>/dev/null || true
+    rm -rf "$staging"; chmod 0644 "$GEOIP_DIR"/*.mmdb
+    install_geoip_updater_service
+    ok "GeoLite2 City, Country, dan ASN tervalidasi dan tersedia."
+}
+
+install_geoip_updater_service() {
+    cat > "$GEOIP_UPDATER" <<'GEOIPUPDATER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${DEFENSEOPS_ROOT:-/opt/defenseops}"; DB="${ROOT}/geoip"; CONF="${ROOT}/secrets/geoipupdate.conf"; BACKUP="${ROOT}/geoip-backup"
+[[ -s "$CONF" ]] || exit 1
+STAGE="$(mktemp -d "${DB}/.staging.XXXXXX")"; TMP="$(mktemp "${ROOT}/secrets/.geoipupdate.XXXXXX")"
+trap 'rm -rf "$STAGE"; rm -f "$TMP"' EXIT
+awk -v dir="$STAGE" '$1 == "DatabaseDirectory" {$2=dir} {print}' "$CONF" > "$TMP"; chmod 0600 "$TMP"
+geoipupdate -f "$TMP"
+python3 - "$STAGE" <<'PY'
+import sys
+from pathlib import Path
+r=Path(sys.argv[1]); marker=bytes.fromhex("abcd ef4d61784d696e642e636f6d".replace(" ",""))
+for n in ("GeoLite2-City.mmdb","GeoLite2-Country.mmdb","GeoLite2-ASN.mmdb"):
+ p=r/n
+ if not p.is_file() or p.stat().st_size<1024: raise SystemExit(f"Missing {n}")
+ with p.open("rb") as f: f.seek(max(0,p.stat().st_size-131072)); b=f.read()
+ if marker not in b: raise SystemExit(f"Invalid {n}")
+PY
+TS="$(date -u +%Y%m%dT%H%M%SZ)"; B="${BACKUP}/${TS}"; install -d -m 0750 "$B"; changed=0
+for n in GeoLite2-City.mmdb GeoLite2-Country.mmdb GeoLite2-ASN.mmdb; do
+ if [[ -s "${DB}/${n}" ]] && ! cmp -s "${STAGE}/${n}" "${DB}/${n}"; then cp -a "${DB}/${n}" "$B/"; fi
+ if [[ ! -s "${DB}/${n}" ]] || ! cmp -s "${STAGE}/${n}" "${DB}/${n}"; then install -m 0644 "${STAGE}/${n}" "${DB}/.${n}.new"; mv -f "${DB}/.${n}.new" "${DB}/${n}"; changed=1; fi
+done
+rmdir "$B" 2>/dev/null || true
+if (( changed )); then
+ touch "${DB}/.indexer-reload-required"
+ echo "GeoLite2 changed; marker .indexer-reload-required created. Schedule an Indexer restart to reload the custom MMDB files."
+else
+ echo "GeoLite2 is current."
+fi
+GEOIPUPDATER
+    chmod 0750 "$GEOIP_UPDATER"
+    cat > /etc/systemd/system/defenseops-geoip-update.service <<EOF
+[Unit]
+Description=Update DefenseOps GeoLite2 databases
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+Environment=DEFENSEOPS_ROOT=${DEFENSEOPS_ROOT}
+ExecStart=${GEOIP_UPDATER}
+EOF
+    cat > /etc/systemd/system/defenseops-geoip-update.timer <<'GEOIPTIMER'
+[Unit]
+Description=Daily check for MaxMind GeoLite2 updates
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+GEOIPTIMER
+    systemctl daemon-reload
+    systemctl enable defenseops-geoip-update.timer
+    systemctl start defenseops-geoip-update.timer
+}
+
+configure_geoip_pipeline() {
+    local payload; payload="$(mktemp)"
+    cat > "$payload" <<'PIPELINE'
+{
+ "description":"DefenseOps GeoIP enrichment for Brebes-WAF events",
+ "processors":[
+  {"script":{"if":"ctx.data != null","source":"if (ctx.data.srcip != null && ctx.data.srcip.toString().length() > 0) { ctx._defenseops_geoip_ip = ctx.data.srcip; } else if (ctx.data.client != null && ctx.data.client.ip != null) { ctx._defenseops_geoip_ip = ctx.data.client.ip; }"}},
+  {"geoip":{"if":"ctx._defenseops_geoip_ip != null","field":"_defenseops_geoip_ip","target_field":"GeoLocation","database_file":"GeoLite2-City.mmdb","properties":["city_name","country_name","region_name","location"],"ignore_missing":true,"ignore_failure":true}},
+  {"remove":{"field":"_defenseops_geoip_ip","ignore_missing":true}}
+ ]
+}
+PIPELINE
+    curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -H 'Content-Type: application/json' -X PUT "https://127.0.0.1:9200/_ingest/pipeline/${GEOIP_PIPELINE}" --data-binary "@${payload}" >/dev/null || { rm -f "$payload"; die "Gagal memasang GeoIP pipeline."; }
+    rm -f "$payload"
+    # Apply the pipeline only to existing alert indices. We deliberately do not
+    # create a competing high-priority composable template that could shadow
+    # Wazuh's own mappings/settings template.
+    local indices index
+    indices="$(curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" 'https://127.0.0.1:9200/_cat/indices/wazuh-alerts-4.x-*?h=index' 2>/dev/null || true)"
+    while IFS= read -r index; do
+        [[ -n "$index" ]] || continue
+        curl -kfsS -u "${WAZUH_DASHBOARD_USERNAME}:${WAZUH_DASHBOARD_PASSWORD}" -H 'Content-Type: application/json' -X PUT "https://127.0.0.1:9200/${index}/_settings" -d "{\"index.final_pipeline\":\"${GEOIP_PIPELINE}\"}" >/dev/null || warn "Gagal memasang final_pipeline pada ${index}."
+    done <<< "$indices"
+    ok "GeoIP pipeline ${GEOIP_PIPELINE} dipasang."
+}
+
 deploy_wazuh() {
     log "Menyiapkan deployment Wazuh ${WAZUH_VERSION}..."
     create_docker_network
@@ -2009,6 +2178,7 @@ deploy_wazuh() {
     docker pull "wazuh/wazuh-indexer:${WAZUH_VERSION}"
 
     load_or_create_credentials
+    prompt_and_configure_geoip
     secure_indexer_internal_users
     prepare_wazuh_config_permissions
     generate_split_compose_files
@@ -2017,6 +2187,7 @@ deploy_wazuh() {
     log "Menjalankan Wazuh Indexer..."
     compose_up indexer
     wait_for_indexer
+    configure_geoip_pipeline
     configure_indexer_retention_policies
 
     log "Menjalankan Wazuh Manager..."
@@ -2031,6 +2202,8 @@ deploy_wazuh() {
     rotate_wazuh_api_admin_password
     configure_filebeat_archives
     wait_for_manager
+    # Re-apply to any alert indices created during Manager startup.
+    configure_geoip_pipeline
     install_manager_archive_retention
 
     log "Menjalankan Wazuh Dashboard..."
@@ -2312,6 +2485,14 @@ print_installation_summary() {
     printf 'Brebes-WAF custom rules: %s\n' "$SUMMARY_CUSTOM_ALERTS"
     printf 'Docker-PHP custom rules: %s\n' "$SUMMARY_DOCKER_PHP_CUSTOM_ALERTS"
 
+    printf '\n%b[ GEOIP / GEOLITE2 ]%b\n' "$BLUE" "$NC"
+    printf 'Database Directory    : %s\n' "$GEOIP_DIR"
+    printf 'MaxMind Config        : %s (permission 0600)\n' "$GEOIP_CONFIG_FILE"
+    printf 'City Database        : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-City.mmdb" && printf OK || printf MISSING)"
+    printf 'Country Database     : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-Country.mmdb" && printf OK || printf MISSING)"
+    printf 'ASN Database         : %s\n' "$(test -s "${GEOIP_DIR}/GeoLite2-ASN.mmdb" && printf OK || printf MISSING)"
+    printf 'Ingest Pipeline      : %s\n' "$GEOIP_PIPELINE"
+    printf 'Auto Update          : %s\n' "$(systemctl is-enabled defenseops-geoip-update.timer 2>/dev/null || printf NOT CONFIGURED)"
     printf '\n%b[ FILEBEAT ARCHIVES ]%b\n' "$BLUE" "$NC"
     printf 'Filebeat Alerts       : %s\n' "$SUMMARY_FILEBEAT_ALERTS"
     printf 'Filebeat Archives     : %s\n' "$SUMMARY_FILEBEAT_ARCHIVES"
@@ -2406,6 +2587,7 @@ main() {
         log "Agent groups dibuat idempotent: Brebes-WAF dan docker-php (tanpa assignment agent otomatis)."
         log "Custom alert rules Brebes-WAF: install idempotent 100500-100506 ke volume Manager; validasi analysisd; tanpa restart tambahan."
         log "Custom alert rules Docker-PHP: install idempotent 100600-100603, 100610, 100620-100621 ke file terpisah pada volume Manager; validasi analysisd; tanpa restart tambahan."
+        log "GeoLite2: MaxMind credentials -> City/Country/ASN -> read-only Indexer mount -> GeoIP pipeline -> daily systemd timer."
         exit 0
     fi
 
