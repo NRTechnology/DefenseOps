@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.18
+# Version     : 1.8.19
 # Release     : 2026-11-17
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.18"
+SCRIPT_VERSION="1.8.19"
 SCRIPT_RELEASE="2026-11-17"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.18"
+INSTALLER_VERSION="1.8.19"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.10.2."""
+"""DefenseOps Docker-PHP collector v1.10.3."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.10.2"
+COLLECTOR_VERSION = "1.10.3"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -797,7 +797,11 @@ MAX_FILES_PER_APP=20000
 CPU_ALERT_PERCENT=85.0
 MEMORY_ALERT_PERCENT=85.0
 WORKER_SURGE_THRESHOLD=50
+# Source/htdocs is restricted to code and configuration extensions.
+# Writable paths are monitored regardless of file extension, except volatile
+# session/cache trees which would otherwise create excessive FIM noise.
 EXCLUDED={".git","vendor","node_modules","storage","cache","sessions","tmp",".idea"}
+WRITABLE_EXCLUDED={"session","sessions","cache"}
 SOURCE_SUFFIXES={".php",".phtml",".inc",".js",".ts",".py",".sh",".conf",".ini",".env.example",".yaml",".yml",".json"}
 
 def emit(app,container,source,event_type,severity,message,details=None):
@@ -951,15 +955,24 @@ def docker_resource_stats(container):
             "memory_limit_bytes":byte_value(mem_parts[1]) if len(mem_parts)>1 else None,
             "block_io":row.get("BlockIO"),"network_io":row.get("NetIO")}
 
-def file_manifest(root):
+def file_manifest(root, source_only=False):
+    """Return SHA256 fingerprints for one approved application directory.
+
+    Source/htdocs uses SOURCE_SUFFIXES. Writable paths accept every regular
+    file type but skip session/cache directories. Symlinks are never followed.
+    """
     result={}
     if not root.is_dir(): return result
+    excluded=EXCLUDED if source_only else WRITABLE_EXCLUDED
+    if root.name.lower() in excluded: return result
     count=0
     for current,dirs,files in os.walk(root,followlinks=False):
-        dirs[:]=[d for d in dirs if d not in EXCLUDED and not (Path(current)/d).is_symlink()]
+        dirs[:]=[d for d in dirs if d.lower() not in excluded and not (Path(current)/d).is_symlink()]
         for name in files:
             p=Path(current)/name
-            if p.is_symlink() or not (p.suffix.lower() in SOURCE_SUFFIXES or p.name.lower().endswith(".env.example")): continue
+            if p.is_symlink(): continue
+            if source_only and not (p.suffix.lower() in SOURCE_SUFFIXES or p.name.lower().endswith(".env.example")):
+                continue
             try:
                 st=p.stat()
                 if not p.is_file() or st.st_size>MAX_FILE_SIZE: continue
@@ -970,6 +983,38 @@ def file_manifest(root):
                 if count>=MAX_FILES_PER_APP: return result
             except OSError: continue
     return result
+
+
+def registered_writable_paths(cfg, app_root, apps_root, app):
+    """Normalize and validate registry writable (string or list of strings)."""
+    raw=cfg.get("writable")
+    if raw is None or raw == "": return []
+    if isinstance(raw,str):
+        candidates=[raw]
+    elif isinstance(raw,list):
+        candidates=raw
+    else:
+        print(f"[WARN] {app}: registry writable must be a string or array; ignoring it.",file=sys.stderr)
+        return []
+    paths=[]
+    seen=set()
+    for item in candidates:
+        if not isinstance(item,str) or not item or "\x00" in item:
+            print(f"[WARN] {app}: invalid writable path entry ignored: {item!r}",file=sys.stderr)
+            continue
+        try:
+            path=Path(item).resolve(strict=True)
+            if not path.is_dir():
+                raise ValueError("not a directory")
+            if not path.is_relative_to(app_root) or not path.is_relative_to(apps_root):
+                raise ValueError("outside this application's /var/apps directory")
+        except (OSError,ValueError) as exc:
+            print(f"[WARN] {app}: writable path rejected ({item}): {exc}",file=sys.stderr)
+            continue
+        value=str(path)
+        if value not in seen:
+            paths.append(path); seen.add(value)
+    return paths
 
 def old_fingerprints(previous,app):
     v=previous.get(app)
@@ -984,9 +1029,11 @@ def monitoring_enabled(cfg, key, default=True):
 
 def main():
     state=load_state(); previous=state.get("containers",{}); previous_files=state.get("files",{})
+    previous_writable_roots=state.get("writable_roots",{})
     if not isinstance(previous,dict): previous={}
     if not isinstance(previous_files,dict): previous_files={}
-    current_containers={}; current_files={}
+    if not isinstance(previous_writable_roots,dict): previous_writable_roots={}
+    current_containers={}; current_files={}; current_writable_roots={}
     if not REGISTRY.is_dir():
         print(f"[WARN] Registry directory unavailable: {REGISTRY}",file=sys.stderr); return 0
     try: registry_files=sorted(REGISTRY.glob("*.json"))
@@ -1004,6 +1051,8 @@ def main():
             source_path=Path(source).resolve(strict=True)
             if not source_path.is_dir() or not source_path.is_relative_to(apps_root):
                 raise ValueError(f"source path outside /var/apps or unavailable: {source}")
+            app_root=source_path.parent
+            writable_paths=registered_writable_paths(cfg,app_root,apps_root,app)
         except (OSError,ValueError,json.JSONDecodeError,AttributeError) as e:
             print(f"[WARN] Invalid registry {rf}: {e}",file=sys.stderr); continue
 
@@ -1114,18 +1163,38 @@ def main():
                          "Docker-PHP PHP-FPM/resource monitoring anomaly recovered",{"snapshot":snapshot})
 
         if do_fim:
-            manifest=file_manifest(source_path)
+            # htdocs/source is extension-filtered; registry writable paths are
+            # unrestricted by extension but exclude session/cache directories.
+            manifest=file_manifest(source_path,source_only=True)
+            current_roots=[str(root) for root in writable_paths]
+            current_writable_roots[app]=current_roots
+            prior_roots=previous_writable_roots.get(app,[])
+            if not isinstance(prior_roots,list): prior_roots=[]
+            for writable_root in writable_paths:
+                manifest.update(file_manifest(writable_root,source_only=False))
+            def in_roots(path,roots):
+                return any(path==root or path.startswith(root+os.sep) for root in roots)
             old=previous_files.get(app)
             if isinstance(old,dict):
                 for path,digest in manifest.items():
                     prior=old.get(path)
+                    is_writable=in_roots(path,current_roots)
+                    scope="writable" if is_writable else "source"
                     if prior is None:
-                        emit(app,container,"fim","file_added","warning","New application source file detected",{"path":path,"sha256":digest})
+                        # Newly enrolled writable roots are baselined silently;
+                        # files created later inside an established root alert normally.
+                        if is_writable and not in_roots(path,prior_roots):
+                            continue
+                        emit(app,container,"fim","file_added","warning","New application file detected",{"path":path,"scope":scope,"sha256":digest})
                     elif prior!=digest:
-                        emit(app,container,"fim","file_modified","high","Application source file modified",{"path":path,"old_sha256":prior,"new_sha256":digest})
+                        emit(app,container,"fim","file_modified","high","Application file modified",{"path":path,"scope":scope,"old_sha256":prior,"new_sha256":digest})
                 for path,digest in old.items():
                     if path not in manifest:
-                        emit(app,container,"fim","file_deleted","warning","Application source file deleted",{"path":path,"old_sha256":digest})
+                        # A writable root removed from the registry is a scope
+                        # change, not evidence that its files were deleted.
+                        if in_roots(path,prior_roots) and not in_roots(path,current_roots):
+                            continue
+                        emit(app,container,"fim","file_deleted","warning","Application file deleted",{"path":path,"old_sha256":digest})
             current_files[app]=manifest
         elif isinstance(previous_files.get(app),dict):
             current_files[app]=previous_files[app]
@@ -1133,7 +1202,8 @@ def main():
         current_containers[app]=entry
 
     save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,
-                "files":current_files,"updated_at":time.time()})
+                "files":current_files,"writable_roots":current_writable_roots,
+                "updated_at":time.time()})
     return 0
 
 if __name__=="__main__": raise SystemExit(main())
@@ -1176,7 +1246,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.10.2 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
+  log "Docker-PHP registry-scoped collector v1.10.3 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
   log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
 }
@@ -2834,7 +2904,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.10.2. Health and security use separate
+  The bundled Docker-PHP collector is v1.10.3. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -2843,10 +2913,15 @@ Docker-PHP:
   The collector honors per-application monitoring flags (docker_health, security,
   php_fpm, fim). The malware flag is explicitly unsupported and produces a warning;
   no malware scan is performed. The collector checks registered container health/security
-  and performs source-file integrity snapshots (PHP and selected source/config extensions)
-  under each registered source path. Writable/cache/vendor/node_modules/.git
-  trees are excluded. First run establishes a baseline; subsequent changes
-  generate JSONL events at /var/log/defenseops/docker-php-events.json.
+  and performs registry-scoped application FIM. Source/htdocs files are limited
+  to SOURCE_SUFFIXES (PHP and selected source/config extensions). Every regular
+  file type under each registered writable path is monitored, including images
+  and documents; session, sessions, and cache directories are excluded. Writable
+  paths may be a single string or an array in the Application Registry. Paths
+  are resolved and must remain inside that application's /var/apps directory;
+  symlinks are not followed. Existing files in newly added writable roots are
+  baselined silently to avoid a burst of false file-added alerts. Subsequent
+  changes generate JSONL events at /var/log/defenseops/docker-php-events.json.
   Wazuh Agent reads that dedicated file as JSON. A systemd timer runs the
   collector every five minutes. It requires Python 3 and Docker CLI access.
   Missing Docker or invalid registry entries are warnings; unrelated containers
