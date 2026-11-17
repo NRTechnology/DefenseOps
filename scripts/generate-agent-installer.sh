@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.15
+# Version     : 1.8.16
 # Release     : 2026-11-16
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.15"
-SCRIPT_RELEASE="2026-11-15"
+SCRIPT_VERSION="1.8.16"
+SCRIPT_RELEASE="2026-11-17"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.15"
+INSTALLER_VERSION="1.8.16"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,17 +783,20 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.9.1."""
+"""DefenseOps Docker-PHP collector v1.10.0."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.9.1"
+COLLECTOR_VERSION = "1.10.0"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
 MAX_FILE_SIZE=10*1024*1024
 MAX_FILES_PER_APP=20000
+CPU_ALERT_PERCENT=85.0
+MEMORY_ALERT_PERCENT=85.0
+WORKER_SURGE_THRESHOLD=50
 EXCLUDED={".git","vendor","node_modules","storage","cache","sessions","tmp",".idea"}
 SOURCE_SUFFIXES={".php",".phtml",".inc",".js",".ts",".py",".sh",".conf",".ini",".env.example",".yaml",".yml",".json"}
 
@@ -827,41 +830,107 @@ def docker_inspect(name):
         a=json.loads(p.stdout); return a[0] if a else None
     except (OSError,subprocess.SubprocessError,json.JSONDecodeError,IndexError): return None
 
-def inspect_php_fpm_workers(container):
-    # Count only processes whose complete cmdline begins with the PHP-FPM
-    # pool-worker title. The master process and docker exec shell are excluded.
+def configured_fpm_socket(cfg):
+    pool_file=cfg.get("fpm_pool")
+    if not isinstance(pool_file,str) or not pool_file.startswith("/"):
+        return None
+    try:
+        content=Path(pool_file).read_text(encoding="utf-8",errors="replace")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        line=line.split(";",1)[0].strip()
+        if line.lower().startswith("listen") and "=" in line:
+            value=line.split("=",1)[1].strip().strip('"').strip("'")
+            if value.startswith("/"):
+                return value
+    return None
+
+def inspect_php_fpm(container,socket_path):
+    # Inspect PHP-FPM pool workers, master process, and configured Unix socket.
+    # The master process is deliberately not counted as a worker.
     cmd=r"""
-found=0
+workers=0
+root_workers=0
+fpm_processes=0
 for p in /proc/[0-9]*; do
  [ -r "$p/cmdline" ] || continue
  c=$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null) || continue
- # Anchored match excludes "php-fpm: master process" and "sh -c ...".
  case "$c" in
-  "php-fpm: pool "?*)
+  "php-fpm: master process"*)
+   fpm_processes=$((fpm_processes+1))
+   ;;
+  "php-fpm: pool "*)
+   workers=$((workers+1))
+   fpm_processes=$((fpm_processes+1))
    u=$(awk '/^Uid:/ {print $2; exit}' "$p/status" 2>/dev/null)
-   case "$u" in ''|*[!0-9]*) continue ;; esac
-   printf '%s\n' "$u"
-   found=1
+   [ "$u" = "0" ] && root_workers=$((root_workers+1))
    ;;
  esac
 done
-# No verifiable pool worker is not proof of safety.
-[ "$found" -eq 1 ] || exit 3
+printf 'workers=%s\nroot_workers=%s\nfpm_processes=%s\n' "$workers" "$root_workers" "$fpm_processes"
+if [ -n "$1" ]; then
+ if awk -v s="$1" '$8==s {found=1} END {exit(found?0:1)}' /proc/net/unix 2>/dev/null; then
+  echo socket_listening=yes
+ else
+  echo socket_listening=no
+ fi
+else
+ echo socket_listening=unknown
+fi
 """
     try:
-        p=subprocess.run(
-            ["docker","exec",container,"sh","-c",cmd],
-            capture_output=True,text=True,timeout=10
-        )
+        p=subprocess.run(["docker","exec",container,"sh","-c",cmd,"sh",socket_path or ""],
+                         capture_output=True,text=True,timeout=10)
     except (OSError,subprocess.SubprocessError):
-        return {"status":"unknown","worker_uids":[]}
+        return {"status":"unknown","workers":None,"root_workers":None,
+                "fpm_processes":None,"socket_path":socket_path,"socket_listening":"unknown"}
+    values={}
+    for line in p.stdout.splitlines():
+        if "=" in line:
+            k,v=line.split("=",1); values[k]=v
+    def number(key):
+        try: return int(values[key])
+        except (KeyError,ValueError): return None
+    workers=number("workers")
+    processes=number("fpm_processes")
+    socket_state=values.get("socket_listening","unknown")
+    if p.returncode != 0 or processes is None:
+        status="unknown"
+    elif processes == 0:
+        status="stopped"
+    elif workers == 0:
+        status="no_workers"
+    else:
+        status="active"
+    return {"status":status,"workers":workers,"root_workers":number("root_workers"),
+            "fpm_processes":processes,"socket_path":socket_path,
+            "socket_listening":socket_state}
 
-    uids=sorted({int(x) for x in p.stdout.split() if x.isdigit()})
-    if p.returncode==0 and uids:
-        return {"status":"checked","worker_uids":uids}
-    if p.returncode==3:
-        return {"status":"no_workers","worker_uids":[]}
-    return {"status":"unknown","worker_uids":[]}
+def docker_resource_stats(container):
+    try:
+        p=subprocess.run(["docker","stats","--no-stream","--format","{{json .}}",container],
+                         capture_output=True,text=True,timeout=15,check=True)
+        row=json.loads(p.stdout.strip().splitlines()[0])
+    except (OSError,subprocess.SubprocessError,json.JSONDecodeError,IndexError):
+        return {"status":"unavailable"}
+    def pct(value):
+        try: return float(str(value).strip().rstrip("%"))
+        except (TypeError,ValueError): return None
+    def byte_value(value):
+        import re
+        m=re.match(r"^\s*([0-9.]+)\s*([KMGT]?i?B)\s*$",str(value),re.I)
+        if not m: return None
+        scale={"B":1,"KB":1000,"MB":1000**2,"GB":1000**3,"TB":1000**4,
+               "KIB":1024,"MIB":1024**2,"GIB":1024**3,"TIB":1024**4}
+        return int(float(m.group(1))*scale.get(m.group(2).upper(),1))
+    mem_usage=row.get("MemUsage","")
+    mem_parts=[x.strip() for x in str(mem_usage).split("/",1)]
+    return {"status":"ok","cpu_percent":pct(row.get("CPUPerc")),
+            "memory_percent":pct(row.get("MemPerc")),
+            "memory_usage_bytes":byte_value(mem_parts[0]) if mem_parts else None,
+            "memory_limit_bytes":byte_value(mem_parts[1]) if len(mem_parts)>1 else None,
+            "block_io":row.get("BlockIO"),"network_io":row.get("NetIO")}
 
 def file_manifest(root):
     result={}
@@ -891,7 +960,7 @@ def main():
     state=load_state(); previous=state.get("containers",{}); previous_files=state.get("files",{})
     if not isinstance(previous,dict): previous={}
     if not isinstance(previous_files,dict): previous_files={}
-    current_containers={}; current_files={}
+    current_containers={}; current_files={}; current_runtime={}
     if not REGISTRY.is_dir():
         print(f"[WARN] Registry directory unavailable: {REGISTRY}",file=sys.stderr); return 0
     try: registry_files=sorted(REGISTRY.glob("*.json"))
@@ -924,8 +993,12 @@ def main():
                 "no_new_privileges":bool(host.get("SecurityOpt") and any("no-new-privileges" in str(x).lower() for x in host.get("SecurityOpt",[]))),
                 "cap_add":host.get("CapAdd") or [],
                 "docker_socket_mounted":any("/var/run/docker.sock" in str(x) for x in (host.get("Binds") or []))}
-            workers=inspect_php_fpm_workers(container)
-            security["php_fpm_worker_check"]=workers["status"]; security["php_fpm_worker_uids"]=workers["worker_uids"]
+            fpm_socket=configured_fpm_socket(cfg)
+            fpm=inspect_php_fpm(container,fpm_socket)
+            security["php_fpm_worker_check"]="checked" if fpm["status"]=="active" else fpm["status"]
+            security["php_fpm_worker_uids"]=[]
+            if fpm.get("root_workers",0)>0:
+                security["php_fpm_worker_uids"]=[0]
             findings=[]
             if security["privileged"]: findings.append("privileged_container")
             if not security["read_only"]: findings.append("read_only_disabled")
@@ -951,6 +1024,49 @@ def main():
             elif olds is not None:
                 emit(app,container,"docker_security","container_security_recovered","info",
                      "Docker-PHP container security baseline recovered",sec)
+
+        # PHP-FPM and resource monitoring: collect a compact snapshot but emit
+        # only on anomaly-state transitions to avoid noisy periodic telemetry.
+        fpm_socket=configured_fpm_socket(cfg)
+        fpm=inspect_php_fpm(container,fpm_socket) if obj is not None else {
+            "status":"container_unavailable","workers":None,"root_workers":None,
+            "fpm_processes":None,"socket_path":fpm_socket,"socket_listening":"unknown"}
+        resources=docker_resource_stats(container) if obj is not None else {"status":"unavailable"}
+        state_obj=(obj.get("State") or {}) if obj is not None else {}
+        restart_count=obj.get("RestartCount",0) if obj is not None else None
+        anomalies=[]
+        if fpm["status"] in ("stopped","no_workers"):
+            anomalies.append("php_fpm_"+fpm["status"])
+        if fpm.get("socket_listening")=="no":
+            anomalies.append("php_fpm_socket_not_listening")
+        if fpm.get("root_workers",0)>0:
+            anomalies.append("php_fpm_root_worker")
+        if fpm.get("workers") is not None and fpm["workers"]>=WORKER_SURGE_THRESHOLD:
+            anomalies.append("php_fpm_worker_surge")
+        if resources.get("cpu_percent") is not None and resources["cpu_percent"]>=CPU_ALERT_PERCENT:
+            anomalies.append("container_cpu_high")
+        if resources.get("memory_percent") is not None and resources["memory_percent"]>=MEMORY_ALERT_PERCENT:
+            anomalies.append("container_memory_high")
+        if bool(state_obj.get("OOMKilled")):
+            anomalies.append("container_oom_killed")
+        snapshot={"php_fpm":fpm,"resources":resources,"oom_killed":bool(state_obj.get("OOMKilled")),
+                  "restart_count":restart_count}
+        runtime_fp=json.dumps(sorted(set(anomalies)),sort_keys=True)
+        old_runtime=previous.get(app,{})
+        old_runtime_fp=old_runtime.get("runtime_anomalies") if isinstance(old_runtime,dict) else None
+        current_runtime[app]={"runtime_anomalies":runtime_fp,"snapshot":snapshot}
+        if old_runtime_fp != runtime_fp:
+            if anomalies:
+                emit(app,container,"php_fpm_resource","runtime_anomaly","high",
+                     "Docker-PHP PHP-FPM/resource monitoring detected an anomaly",
+                     {"anomalies":sorted(set(anomalies)),"snapshot":snapshot,
+                      "thresholds":{"cpu_percent":CPU_ALERT_PERCENT,
+                                    "memory_percent":MEMORY_ALERT_PERCENT,
+                                    "worker_surge":WORKER_SURGE_THRESHOLD}})
+            elif old_runtime_fp not in (None,"[]"):
+                emit(app,container,"php_fpm_resource","runtime_recovered","info",
+                     "Docker-PHP PHP-FPM/resource monitoring anomaly recovered",
+                     {"snapshot":snapshot})
         manifest=file_manifest(source_path); current_files[app]=manifest
         old=previous_files.get(app)
         if isinstance(old,dict):
@@ -963,6 +1079,9 @@ def main():
             for path,digest in old.items():
                 if path not in manifest:
                     emit(app,container,"fim","file_deleted","warning","Application source file deleted",{"path":path,"old_sha256":digest})
+    for app, runtime in current_runtime.items():
+        if app in current_containers:
+            current_containers[app].update(runtime)
     save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,"files":current_files,"updated_at":time.time()})
     return 0
 
@@ -1006,8 +1125,9 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.9.1 installed (health/security/FIM)."
+  log "Docker-PHP registry-scoped collector v1.10.0 installed (health/security/FIM/PHP-FPM/resource)."
   log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
+  log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
 }
 
 stage_modsecurity_collector(){
@@ -2717,7 +2837,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.9.1
+Docker-PHP collector : v1.10.0
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -2780,7 +2900,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.9.1. Health and security use separate
+  The bundled Docker-PHP collector is v1.10.0. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -2842,7 +2962,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.9.1 + Compose-discovered /var/apps FIM)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.0 + PHP-FPM/resource monitoring)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
