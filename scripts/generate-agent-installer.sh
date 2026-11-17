@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.16"
+SCRIPT_VERSION="1.8.17"
 SCRIPT_RELEASE="2026-11-17"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.16"
+INSTALLER_VERSION="1.8.17"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.10.0."""
+"""DefenseOps Docker-PHP collector v1.10.1."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.10.0"
+COLLECTOR_VERSION = "1.10.1"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -940,7 +940,7 @@ def file_manifest(root):
         dirs[:]=[d for d in dirs if d not in EXCLUDED and not (Path(current)/d).is_symlink()]
         for name in files:
             p=Path(current)/name
-            if p.is_symlink() or p.suffix.lower() not in SOURCE_SUFFIXES: continue
+            if p.is_symlink() or not (p.suffix.lower() in SOURCE_SUFFIXES or p.name.lower().endswith(".env.example")): continue
             try:
                 st=p.stat()
                 if not p.is_file() or st.st_size>MAX_FILE_SIZE: continue
@@ -956,11 +956,18 @@ def old_fingerprints(previous,app):
     v=previous.get(app)
     return (v.get("health"),v.get("security")) if isinstance(v,dict) else (None,None)
 
+def monitoring_enabled(cfg, key, default=True):
+    flags=cfg.get("monitoring")
+    if not isinstance(flags,dict):
+        return default
+    value=flags.get(key,default)
+    return value is True
+
 def main():
     state=load_state(); previous=state.get("containers",{}); previous_files=state.get("files",{})
     if not isinstance(previous,dict): previous={}
     if not isinstance(previous_files,dict): previous_files={}
-    current_containers={}; current_files={}; current_runtime={}
+    current_containers={}; current_files={}
     if not REGISTRY.is_dir():
         print(f"[WARN] Registry directory unavailable: {REGISTRY}",file=sys.stderr); return 0
     try: registry_files=sorted(REGISTRY.glob("*.json"))
@@ -970,119 +977,142 @@ def main():
     for rf in registry_files:
         try:
             cfg=json.loads(rf.read_text(encoding="utf-8"))
+            if not isinstance(cfg,dict):
+                raise ValueError("registry root must be a JSON object")
             app,container,source=cfg.get("application"),cfg.get("container"),cfg.get("source")
             if not all(isinstance(x,str) and x and "\x00" not in x for x in (app,container,source)):
-                print(f"[WARN] Invalid registry entry skipped: {rf}",file=sys.stderr); continue
+                raise ValueError("application, container and source must be non-empty strings")
             source_path=Path(source).resolve(strict=True)
             if not source_path.is_dir() or not source_path.is_relative_to(apps_root):
-                print(f"[WARN] Source path outside /var/apps or unavailable: {source}",file=sys.stderr); continue
+                raise ValueError(f"source path outside /var/apps or unavailable: {source}")
         except (OSError,ValueError,json.JSONDecodeError,AttributeError) as e:
             print(f"[WARN] Invalid registry {rf}: {e}",file=sys.stderr); continue
-        obj=docker_inspect(container)
-        if obj is None:
-            status="not_found"; health={"status":status,"registry":str(rf)}
-            sec={"inspection":"unavailable","security_findings":[]}
-        else:
-            st=obj.get("State") or {}; ho=st.get("Health") or {}
-            status=ho.get("Status") or st.get("Status") or "unknown"
-            health={"status":status,"restart_count":obj.get("RestartCount",0),
-                    "health_failing_streak":ho.get("FailingStreak",0)}
-            host=obj.get("HostConfig") or {}; conf=obj.get("Config") or {}
-            security={"privileged":bool(host.get("Privileged")),"read_only":bool(host.get("ReadonlyRootfs")),
-                "configured_user":conf.get("User") or "root(default)",
-                "no_new_privileges":bool(host.get("SecurityOpt") and any("no-new-privileges" in str(x).lower() for x in host.get("SecurityOpt",[]))),
-                "cap_add":host.get("CapAdd") or [],
-                "docker_socket_mounted":any("/var/run/docker.sock" in str(x) for x in (host.get("Binds") or []))}
-            fpm_socket=configured_fpm_socket(cfg)
-            fpm=inspect_php_fpm(container,fpm_socket)
-            security["php_fpm_worker_check"]="checked" if fpm["status"]=="active" else fpm["status"]
-            security["php_fpm_worker_uids"]=[]
-            if fpm.get("root_workers",0)>0:
-                security["php_fpm_worker_uids"]=[0]
-            findings=[]
-            if security["privileged"]: findings.append("privileged_container")
-            if not security["read_only"]: findings.append("read_only_disabled")
-            if workers["status"]=="checked" and 0 in workers["worker_uids"]: findings.append("root_user")
-            elif workers["status"]!="checked": findings.append("needs_review")
-            if not security["no_new_privileges"]: findings.append("no_new_privileges_disabled")
-            if security["docker_socket_mounted"]: findings.append("docker_socket_mounted")
-            if security["cap_add"]: findings.append("capabilities_added")
-            sec={"security":security,"security_findings":sorted(set(findings))}
-        hfp=json.dumps(health,sort_keys=True); sfp=json.dumps(sec,sort_keys=True)
-        oldh,olds=old_fingerprints(previous,app)
-        current_containers[app]={"health":hfp,"security":sfp}
-        if oldh!=hfp:
-            emit(app,container,"docker_health","container_state_changed",
-                 "high" if status in ("unhealthy","not_found","dead") else "info",
-                 "Docker-PHP container health state changed",health)
-        if olds!=sfp:
-            findings=sec.get("security_findings",[])
-            if findings:
-                emit(app,container,"docker_security","container_security_finding",
-                     "high" if "root_user" in findings else "medium",
-                     "Docker-PHP container security baseline finding",sec)
-            elif olds is not None:
-                emit(app,container,"docker_security","container_security_recovered","info",
-                     "Docker-PHP container security baseline recovered",sec)
 
-        # PHP-FPM and resource monitoring: collect a compact snapshot but emit
-        # only on anomaly-state transitions to avoid noisy periodic telemetry.
-        fpm_socket=configured_fpm_socket(cfg)
-        fpm=inspect_php_fpm(container,fpm_socket) if obj is not None else {
-            "status":"container_unavailable","workers":None,"root_workers":None,
-            "fpm_processes":None,"socket_path":fpm_socket,"socket_listening":"unknown"}
-        resources=docker_resource_stats(container) if obj is not None else {"status":"unavailable"}
-        state_obj=(obj.get("State") or {}) if obj is not None else {}
-        restart_count=obj.get("RestartCount",0) if obj is not None else None
-        anomalies=[]
-        if fpm["status"] in ("stopped","no_workers"):
-            anomalies.append("php_fpm_"+fpm["status"])
-        if fpm.get("socket_listening")=="no":
-            anomalies.append("php_fpm_socket_not_listening")
-        if fpm.get("root_workers",0)>0:
-            anomalies.append("php_fpm_root_worker")
-        if fpm.get("workers") is not None and fpm["workers"]>=WORKER_SURGE_THRESHOLD:
-            anomalies.append("php_fpm_worker_surge")
-        if resources.get("cpu_percent") is not None and resources["cpu_percent"]>=CPU_ALERT_PERCENT:
-            anomalies.append("container_cpu_high")
-        if resources.get("memory_percent") is not None and resources["memory_percent"]>=MEMORY_ALERT_PERCENT:
-            anomalies.append("container_memory_high")
-        if bool(state_obj.get("OOMKilled")):
-            anomalies.append("container_oom_killed")
-        snapshot={"php_fpm":fpm,"resources":resources,"oom_killed":bool(state_obj.get("OOMKilled")),
-                  "restart_count":restart_count}
-        runtime_fp=json.dumps(sorted(set(anomalies)),sort_keys=True)
-        old_runtime=previous.get(app,{})
-        old_runtime_fp=old_runtime.get("runtime_anomalies") if isinstance(old_runtime,dict) else None
-        current_runtime[app]={"runtime_anomalies":runtime_fp,"snapshot":snapshot}
-        if old_runtime_fp != runtime_fp:
-            if anomalies:
-                emit(app,container,"php_fpm_resource","runtime_anomaly","high",
-                     "Docker-PHP PHP-FPM/resource monitoring detected an anomaly",
-                     {"anomalies":sorted(set(anomalies)),"snapshot":snapshot,
-                      "thresholds":{"cpu_percent":CPU_ALERT_PERCENT,
-                                    "memory_percent":MEMORY_ALERT_PERCENT,
-                                    "worker_surge":WORKER_SURGE_THRESHOLD}})
-            elif old_runtime_fp not in (None,"[]"):
-                emit(app,container,"php_fpm_resource","runtime_recovered","info",
-                     "Docker-PHP PHP-FPM/resource monitoring anomaly recovered",
-                     {"snapshot":snapshot})
-        manifest=file_manifest(source_path); current_files[app]=manifest
-        old=previous_files.get(app)
-        if isinstance(old,dict):
-            for path,digest in manifest.items():
-                prior=old.get(path)
-                if prior is None:
-                    emit(app,container,"fim","file_added","warning","New application source file detected",{"path":path,"sha256":digest})
-                elif prior!=digest:
-                    emit(app,container,"fim","file_modified","high","Application source file modified",{"path":path,"old_sha256":prior,"new_sha256":digest})
-            for path,digest in old.items():
-                if path not in manifest:
-                    emit(app,container,"fim","file_deleted","warning","Application source file deleted",{"path":path,"old_sha256":digest})
-    for app, runtime in current_runtime.items():
-        if app in current_containers:
-            current_containers[app].update(runtime)
-    save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,"files":current_files,"updated_at":time.time()})
+        do_health=monitoring_enabled(cfg,"docker_health")
+        do_security=monitoring_enabled(cfg,"security")
+        do_fpm=monitoring_enabled(cfg,"php_fpm")
+        do_fim=monitoring_enabled(cfg,"fim")
+        if monitoring_enabled(cfg,"malware",False):
+            print(f"[WARN] {app}: monitoring.malware=true is not implemented by this collector; no malware scan is performed.",file=sys.stderr)
+
+        old_entry=previous.get(app,{})
+        if not isinstance(old_entry,dict): old_entry={}
+        entry=dict(old_entry)
+        obj=docker_inspect(container)
+        status="unknown"
+        if do_health:
+            if obj is None:
+                status="not_found"; health={"status":status,"registry":str(rf)}
+            else:
+                st=obj.get("State") or {}; ho=st.get("Health") or {}
+                status=ho.get("Status") or st.get("Status") or "unknown"
+                health={"status":status,"restart_count":obj.get("RestartCount",0),
+                        "health_failing_streak":ho.get("FailingStreak",0)}
+            hfp=json.dumps(health,sort_keys=True)
+            oldh=old_entry.get("health")
+            entry["health"]=hfp
+            if oldh!=hfp:
+                emit(app,container,"docker_health","container_state_changed",
+                     "high" if status in ("unhealthy","not_found","dead") else "info",
+                     "Docker-PHP container health state changed",health)
+
+        if do_security:
+            if obj is None:
+                sec={"inspection":"unavailable","security_findings":[]}
+            else:
+                host=obj.get("HostConfig") or {}; conf=obj.get("Config") or {}
+                security={"privileged":bool(host.get("Privileged")),"read_only":bool(host.get("ReadonlyRootfs")),
+                    "configured_user":conf.get("User") or "root(default)",
+                    "no_new_privileges":bool(host.get("SecurityOpt") and any("no-new-privileges" in str(x).lower() for x in host.get("SecurityOpt",[]))),
+                    "cap_add":host.get("CapAdd") or [],
+                    "docker_socket_mounted":any("/var/run/docker.sock" in str(x) for x in (host.get("Binds") or []))}
+                findings=[]
+                if security["privileged"]: findings.append("privileged_container")
+                if not security["read_only"]: findings.append("read_only_disabled")
+                if not security["no_new_privileges"]: findings.append("no_new_privileges_disabled")
+                if security["docker_socket_mounted"]: findings.append("docker_socket_mounted")
+                if security["cap_add"]: findings.append("capabilities_added")
+                if do_fpm:
+                    fpm=inspect_php_fpm(container,configured_fpm_socket(cfg))
+                    security["php_fpm_worker_check"]="checked" if fpm["status"]=="active" else fpm["status"]
+                    security["php_fpm_worker_uids"]=[0] if (fpm.get("root_workers") or 0)>0 else []
+                    if (fpm.get("root_workers") or 0)>0:
+                        findings.append("root_user")
+                    elif fpm.get("status")!="active":
+                        findings.append("needs_review")
+                sec={"security":security,"security_findings":sorted(set(findings))}
+            sfp=json.dumps(sec,sort_keys=True)
+            olds=old_entry.get("security")
+            entry["security"]=sfp
+            if olds!=sfp:
+                findings=sec.get("security_findings",[])
+                if findings:
+                    emit(app,container,"docker_security","container_security_finding",
+                         "high" if "root_user" in findings else "medium",
+                         "Docker-PHP container security baseline finding",sec)
+                elif olds is not None:
+                    emit(app,container,"docker_security","container_security_recovered","info",
+                         "Docker-PHP container security baseline recovered",sec)
+
+        if do_fpm:
+            fpm_socket=configured_fpm_socket(cfg)
+            fpm=inspect_php_fpm(container,fpm_socket) if obj is not None else {
+                "status":"container_unavailable","workers":None,"root_workers":None,
+                "fpm_processes":None,"socket_path":fpm_socket,"socket_listening":"unknown"}
+            resources=docker_resource_stats(container) if obj is not None else {"status":"unavailable"}
+            state_obj=(obj.get("State") or {}) if obj is not None else {}
+            restart_count=obj.get("RestartCount",0) if obj is not None else None
+            anomalies=[]
+            if fpm["status"] in ("stopped","no_workers"):
+                anomalies.append("php_fpm_"+fpm["status"])
+            if fpm.get("socket_listening")=="no": anomalies.append("php_fpm_socket_not_listening")
+            if (fpm.get("root_workers") or 0)>0: anomalies.append("php_fpm_root_worker")
+            if fpm.get("workers") is not None and fpm["workers"]>=WORKER_SURGE_THRESHOLD:
+                anomalies.append("php_fpm_worker_surge")
+            if resources.get("cpu_percent") is not None and resources["cpu_percent"]>=CPU_ALERT_PERCENT:
+                anomalies.append("container_cpu_high")
+            if resources.get("memory_percent") is not None and resources["memory_percent"]>=MEMORY_ALERT_PERCENT:
+                anomalies.append("container_memory_high")
+            if bool(state_obj.get("OOMKilled")): anomalies.append("container_oom_killed")
+            snapshot={"php_fpm":fpm,"resources":resources,"oom_killed":bool(state_obj.get("OOMKilled")),
+                      "restart_count":restart_count}
+            runtime_fp=json.dumps(sorted(set(anomalies)),sort_keys=True)
+            old_runtime_fp=old_entry.get("runtime_anomalies")
+            entry["runtime_anomalies"]=runtime_fp
+            entry["snapshot"]=snapshot
+            if old_runtime_fp!=runtime_fp:
+                if anomalies:
+                    emit(app,container,"php_fpm_resource","runtime_anomaly","high",
+                         "Docker-PHP PHP-FPM/resource monitoring detected an anomaly",
+                         {"anomalies":sorted(set(anomalies)),"snapshot":snapshot,
+                          "thresholds":{"cpu_percent":CPU_ALERT_PERCENT,
+                                        "memory_percent":MEMORY_ALERT_PERCENT,
+                                        "worker_surge":WORKER_SURGE_THRESHOLD}})
+                elif old_runtime_fp not in (None,"[]"):
+                    emit(app,container,"php_fpm_resource","runtime_recovered","info",
+                         "Docker-PHP PHP-FPM/resource monitoring anomaly recovered",{"snapshot":snapshot})
+
+        if do_fim:
+            manifest=file_manifest(source_path)
+            old=previous_files.get(app)
+            if isinstance(old,dict):
+                for path,digest in manifest.items():
+                    prior=old.get(path)
+                    if prior is None:
+                        emit(app,container,"fim","file_added","warning","New application source file detected",{"path":path,"sha256":digest})
+                    elif prior!=digest:
+                        emit(app,container,"fim","file_modified","high","Application source file modified",{"path":path,"old_sha256":prior,"new_sha256":digest})
+                for path,digest in old.items():
+                    if path not in manifest:
+                        emit(app,container,"fim","file_deleted","warning","Application source file deleted",{"path":path,"old_sha256":digest})
+            current_files[app]=manifest
+        elif isinstance(previous_files.get(app),dict):
+            current_files[app]=previous_files[app]
+
+        current_containers[app]=entry
+
+    save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,
+                "files":current_files,"updated_at":time.time()})
     return 0
 
 if __name__=="__main__": raise SystemExit(main())
@@ -1125,7 +1155,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.10.0 installed (health/security/FIM/PHP-FPM/resource)."
+  log "Docker-PHP registry-scoped collector v1.10.1 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
   log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
 }
@@ -2084,62 +2114,9 @@ activate_modsecurity_collector(){
   log "DefenseOps ModSecurity collector daemon is active and enabled at boot (inotify + internal scheduler)."
 }
 
-# Discover first-level Docker-PHP Compose projects and their matching /var/apps
-# directories. This is endpoint-local and only runs for the Docker-PHP profile.
+# Docker-PHP application scope comes exclusively from the prepared Application Registry.
+# No Compose discovery and no broad /var/apps paths are injected into native Syscheck.
 DOCKER_PHP_APP_DIRS_FILE=""
-
-discover_docker_php_apps(){
-  local roots=("/opt/docker-apps" "/opt/docker-app")
-  local root project candidate target resolved_target found=0
-  DOCKER_PHP_APP_DIRS_FILE="$(mktemp)"
-
-  for root in "${roots[@]}"; do
-    [[ -d "$root" ]] || continue
-    while IFS= read -r -d '' project; do
-      local has_compose=0 app_name
-      for candidate in docker-compose.yml compose.yaml compose.yml; do
-        if [[ -f "$project/$candidate" ]]; then
-          has_compose=1
-          break
-        fi
-      done
-      (( has_compose == 1 )) || continue
-
-      app_name="$(basename -- "$project")"
-      [[ -n "$app_name" && "$app_name" != "." && "$app_name" != ".." ]] || continue
-      [[ "$app_name" != *$'\n'* && "$app_name" != *$'\t'* ]] || {
-        warn "Skipping Docker-PHP project with unsupported directory name."
-        continue
-      }
-
-      target="/var/apps/${app_name}"
-      [[ -d "$target" ]] || {
-        warn "Docker-PHP project '${app_name}' has no matching ${target}; FIM path skipped."
-        continue
-      }
-      resolved_target="$(readlink -f -- "$target")" || continue
-      case "$resolved_target" in
-        /var/apps/*) ;;
-        *)
-          warn "Skipping ${target}: resolved path is outside /var/apps."
-          continue
-          ;;
-      esac
-
-      if ! grep -Fqx -- "$resolved_target" "$DOCKER_PHP_APP_DIRS_FILE"; then
-        printf '%s\n' "$resolved_target" >> "$DOCKER_PHP_APP_DIRS_FILE"
-        found=$((found + 1))
-        log "Docker-PHP application discovered: ${app_name} -> ${resolved_target}"
-      fi
-    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-  done
-
-  if (( found == 0 )); then
-    warn "No matching Docker-PHP application directories found under /opt/docker-apps or /opt/docker-app."
-  else
-    log "Docker-PHP FIM directories discovered: ${found}"
-  fi
-}
 
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   log "Inspecting every active Nginx virtual host and validating JSON access logs..."
@@ -2147,8 +2124,7 @@ if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
   log "Brebes-WAF JSON validation passed."
 else
   log "Docker-PHP endpoint profile selected."
-  log "Discovering Docker-PHP application directories under /opt/docker-apps..."
-  discover_docker_php_apps
+  log "Application scope will be read exclusively from the Docker-PHP Application Registry."
 fi
 
 # Stage the parser only after local ModSecurity discovery has succeeded.
@@ -2414,14 +2390,14 @@ trap cleanup_files EXIT
 # staging file. The original remains untouched until all pre-activation checks pass.
 cp -a -- "$AGENT_CONF" "$TMP_AGENT_CONF"
 
-python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" "$MANAGER" "$RESET_EXISTING" "$DOCKER_PHP_APP_DIRS_FILE" <<'PYMERGE'
+python3 - "$AGENT_CONF" "$TMP_AGENT_CONF" "$ENDPOINT_PROFILE" "$PATHS_FILE" "$MANAGER" "$RESET_EXISTING" <<'PYMERGE'
 import html
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-source, destination, profile, paths_file, expected_manager, reset_existing, docker_php_dirs_file = sys.argv[1:8]
+source, destination, profile, paths_file, expected_manager, reset_existing = sys.argv[1:7]
 original = Path(source).read_text(encoding="utf-8")
 text = original
 
@@ -2597,9 +2573,8 @@ if profile == "brebes-waf":
                     text[first.start():])
 
 elif profile == "docker-php":
-    # Docker-PHP owns only its dedicated JSONL input and Compose-discovered
-    # application directories under /var/apps. No global Docker/Nginx logs
-    # or unrelated container paths are added.
+    # The registry-scoped collector writes this JSONL file. Keep OS Syscheck
+    # untouched; per-application FIM is performed only by the registry collector.
     docker_php_log = "/var/log/defenseops/docker-php-events.json"
     existing = set()
     for node in parsed.iter("localfile"):
@@ -2616,68 +2591,6 @@ elif profile == "docker-php":
                 f"    <location>{docker_php_log}</location>\n"
                 "    <log_format>json</log_format>\n"
                 "  </localfile>\n" + text[insert_at:])
-
-    # Add every discovered /var/apps/<application> directory to syscheck.
-    # Preserve existing directories/options and keep this merge idempotent.
-    docker_php_dirs = []
-    for raw in Path(docker_php_dirs_file).read_text(encoding="utf-8").splitlines():
-        path = raw.strip()
-        if not path:
-            continue
-        if not path.startswith("/var/apps/") or path == "/var/apps/":
-            raise SystemExit(f"Unsafe Docker-PHP FIM path rejected: {path!r}")
-        if any(ch in path for ch in ("\x00", "\n", "\r", "\t")):
-            raise SystemExit(f"Invalid Docker-PHP FIM path rejected: {path!r}")
-        docker_php_dirs.append(path)
-
-    if docker_php_dirs:
-        watched = set()
-        for node in parsed.iter("syscheck"):
-            for directory in node.findall("directories"):
-                value = (directory.text or "").strip()
-                if value:
-                    watched.add(value)
-
-        missing_dirs = [path for path in sorted(set(docker_php_dirs)) if path not in watched]
-        if missing_dirs:
-            syscheck_match = re.search(
-                r"<syscheck\b[^>]*>.*?</syscheck\s*>",
-                text, flags=re.DOTALL
-            )
-            if syscheck_match:
-                closing = re.search(r"(?m)^([ \t]*)</syscheck\s*>", syscheck_match.group(0))
-                if not closing:
-                    raise SystemExit("Could not locate </syscheck>; refusing to modify Docker-PHP FIM settings.")
-                indent = closing.group(1)
-                insert_at = syscheck_match.start() + closing.start()
-                additions = "".join(
-                    indent + '  <directories realtime="yes">' +
-                    html.escape(path, quote=False) +
-                    '</directories>\n'
-                    for path in missing_dirs
-                )
-                text = text[:insert_at] + additions + text[insert_at:]
-            else:
-                first = re.search(r"</ossec_config\s*>", text)
-                if not first:
-                    raise SystemExit("Could not locate </ossec_config>; refusing to add Docker-PHP FIM settings.")
-                additions = (
-                    "  <syscheck>\n" +
-                    "".join(
-                        '    <directories realtime="yes">' +
-                        html.escape(path, quote=False) +
-                        '</directories>\n'
-                        for path in missing_dirs
-                    ) +
-                    "  </syscheck>\n"
-                )
-                text = text[:first.start()] + additions + text[first.start():]
-            for path in missing_dirs:
-                print(f"[INFO] Added Docker-PHP FIM directory: {path}")
-        else:
-            print("[INFO] All discovered Docker-PHP application directories are already monitored by FIM.")
-    else:
-        print("[INFO] No Docker-PHP application directories were discovered; no FIM directory was added.")
 
 try:
     ET.fromstring("<defenseops_validation_root>" +
@@ -2837,7 +2750,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.10.0
+Docker-PHP collector : v1.10.1
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -2900,14 +2813,16 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.10.0. Health and security use separate
+  The bundled Docker-PHP collector is v1.10.1. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
   worker can be verified or inspection fails, the collector reports
   needs_review instead of asserting the container is safe.
-  The collector checks registered container health/security and performs
-  source-file integrity snapshots (PHP and selected source/config extensions)
+  The collector honors per-application monitoring flags (docker_health, security,
+  php_fpm, fim). The malware flag is explicitly unsupported and produces a warning;
+  no malware scan is performed. The collector checks registered container health/security
+  and performs source-file integrity snapshots (PHP and selected source/config extensions)
   under each registered source path. Writable/cache/vendor/node_modules/.git
   trees are excluded. First run establishes a baseline; subsequent changes
   generate JSONL events at /var/log/defenseops/docker-php-events.json.
@@ -2962,7 +2877,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.0 + PHP-FPM/resource monitoring)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.1 + registry-scoped monitoring)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
