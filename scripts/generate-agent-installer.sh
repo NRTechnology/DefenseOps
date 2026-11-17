@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.16
-# Release     : 2026-11-16
+# Version     : 1.8.18
+# Release     : 2026-11-17
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.17"
+SCRIPT_VERSION="1.8.18"
 SCRIPT_RELEASE="2026-11-17"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.17"
+INSTALLER_VERSION="1.8.18"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.10.1."""
+"""DefenseOps Docker-PHP collector v1.10.2."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.10.1"
+COLLECTOR_VERSION = "1.10.2"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -853,6 +853,7 @@ def inspect_php_fpm(container,socket_path):
 workers=0
 root_workers=0
 fpm_processes=0
+worker_uids=""
 for p in /proc/[0-9]*; do
  [ -r "$p/cmdline" ] || continue
  c=$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null) || continue
@@ -864,11 +865,18 @@ for p in /proc/[0-9]*; do
    workers=$((workers+1))
    fpm_processes=$((fpm_processes+1))
    u=$(awk '/^Uid:/ {print $2; exit}' "$p/status" 2>/dev/null)
+   if [ -n "$u" ]; then
+    case ",$worker_uids," in
+     *,"$u",*) ;;
+     *) worker_uids="${worker_uids}${worker_uids:+,}$u" ;;
+    esac
+   fi
    [ "$u" = "0" ] && root_workers=$((root_workers+1))
    ;;
  esac
 done
-printf 'workers=%s\nroot_workers=%s\nfpm_processes=%s\n' "$workers" "$root_workers" "$fpm_processes"
+printf 'workers=%s\nroot_workers=%s\nfpm_processes=%s\nworker_uids=%s\n' \
+ "$workers" "$root_workers" "$fpm_processes" "$worker_uids"
 if [ -n "$1" ]; then
  if awk -v s="$1" '$8==s {found=1} END {exit(found?0:1)}' /proc/net/unix 2>/dev/null; then
   echo socket_listening=yes
@@ -884,7 +892,8 @@ fi
                          capture_output=True,text=True,timeout=10)
     except (OSError,subprocess.SubprocessError):
         return {"status":"unknown","workers":None,"root_workers":None,
-                "fpm_processes":None,"socket_path":socket_path,"socket_listening":"unknown"}
+                "fpm_processes":None,"worker_uids":[],"root_worker_uids":[],
+                "socket_path":socket_path,"socket_listening":"unknown"}
     values={}
     for line in p.stdout.splitlines():
         if "=" in line:
@@ -894,6 +903,15 @@ fi
         except (KeyError,ValueError): return None
     workers=number("workers")
     processes=number("fpm_processes")
+    worker_uids=[]
+    for uid in values.get("worker_uids", "").split(","):
+        try:
+            if uid.strip():
+                worker_uids.append(int(uid.strip()))
+        except ValueError:
+            continue
+    worker_uids=sorted(set(worker_uids))
+    root_worker_uids=[uid for uid in worker_uids if uid == 0]
     socket_state=values.get("socket_listening","unknown")
     if p.returncode != 0 or processes is None:
         status="unknown"
@@ -904,7 +922,8 @@ fi
     else:
         status="active"
     return {"status":status,"workers":workers,"root_workers":number("root_workers"),
-            "fpm_processes":processes,"socket_path":socket_path,
+            "fpm_processes":processes,"worker_uids":worker_uids,
+            "root_worker_uids":root_worker_uids,"socket_path":socket_path,
             "socket_listening":socket_state}
 
 def docker_resource_stats(container):
@@ -1035,7 +1054,8 @@ def main():
                 if do_fpm:
                     fpm=inspect_php_fpm(container,configured_fpm_socket(cfg))
                     security["php_fpm_worker_check"]="checked" if fpm["status"]=="active" else fpm["status"]
-                    security["php_fpm_worker_uids"]=[0] if (fpm.get("root_workers") or 0)>0 else []
+                    security["php_fpm_worker_uids"]=fpm.get("worker_uids", [])
+                    security["php_fpm_root_worker_uids"]=fpm.get("root_worker_uids", [])
                     if (fpm.get("root_workers") or 0)>0:
                         findings.append("root_user")
                     elif fpm.get("status")!="active":
@@ -1058,7 +1078,8 @@ def main():
             fpm_socket=configured_fpm_socket(cfg)
             fpm=inspect_php_fpm(container,fpm_socket) if obj is not None else {
                 "status":"container_unavailable","workers":None,"root_workers":None,
-                "fpm_processes":None,"socket_path":fpm_socket,"socket_listening":"unknown"}
+                "fpm_processes":None,"worker_uids":[],"root_worker_uids":[],
+                "socket_path":fpm_socket,"socket_listening":"unknown"}
             resources=docker_resource_stats(container) if obj is not None else {"status":"unavailable"}
             state_obj=(obj.get("State") or {}) if obj is not None else {}
             restart_count=obj.get("RestartCount",0) if obj is not None else None
@@ -1155,7 +1176,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.10.1 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
+  log "Docker-PHP registry-scoped collector v1.10.2 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
   log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
 }
@@ -2750,7 +2771,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.10.1
+Docker-PHP collector : v1.10.2
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -2813,7 +2834,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.10.1. Health and security use separate
+  The bundled Docker-PHP collector is v1.10.2. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -2877,7 +2898,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.1 + registry-scoped monitoring)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.2 + registry-scoped monitoring)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
