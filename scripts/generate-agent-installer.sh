@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.19
+# Version     : 1.8.20
 # Release     : 2026-11-17
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.19"
-SCRIPT_RELEASE="2026-11-17"
+SCRIPT_VERSION="1.8.20"
+SCRIPT_RELEASE="2026-11-19"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.19"
+INSTALLER_VERSION="1.8.20"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP collector v1.10.3."""
+"""DefenseOps Docker-PHP runtime collector v1.11.0."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.10.3"
+COLLECTOR_VERSION = "1.11.0"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -1059,7 +1059,9 @@ def main():
         do_health=monitoring_enabled(cfg,"docker_health")
         do_security=monitoring_enabled(cfg,"security")
         do_fpm=monitoring_enabled(cfg,"php_fpm")
-        do_fim=monitoring_enabled(cfg,"fim")
+        # File integrity is owned exclusively by the dedicated inotify daemon.
+        # Wazuh Syscheck does not watch application trees; it only ingests JSONL.
+        do_fim=False
         if monitoring_enabled(cfg,"malware",False):
             print(f"[WARN] {app}: monitoring.malware=true is not implemented by this collector; no malware scan is performed.",file=sys.stderr)
 
@@ -1201,6 +1203,9 @@ def main():
 
         current_containers[app]=entry
 
+    # FIM ownership moved to the inotify daemon. Preserve the old manifest and
+    # writable-root metadata for migration/recovery; never erase it here.
+    current_writable_roots=previous_writable_roots
     save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,
                 "files":current_files,"writable_roots":current_writable_roots,
                 "updated_at":time.time()})
@@ -1211,6 +1216,258 @@ PYDOCKERPHP
   chown root:root "${collector}.tmp.$$"
   chmod 0750 "${collector}.tmp.$$"
   mv -f "${collector}.tmp.$$" "$collector"
+
+  # Dedicated registry-scoped inotify FIM daemon. This is the sole component
+  # that watches application source/writable directories and computes hashes.
+  local fim_collector="${lib_dir}/defenseops-docker-php-inotify.py"
+  cat > "${fim_collector}.tmp.$$" <<'PYINOTIFY'
+#!/usr/bin/env python3
+"""DefenseOps Docker-PHP registry-scoped inotify FIM daemon v1.0.0."""
+import ctypes, ctypes.util, datetime as dt, grp, hashlib, json, os, select, signal, sqlite3, struct, sys, time
+from pathlib import Path
+
+REGISTRY=Path('/var/lib/docker-php/monitoring/applications')
+DB=Path('/var/lib/defenseops/docker-php/inotify-fim.sqlite3')
+OUTPUT=Path('/var/log/defenseops/docker-php-events.json')
+APPS_ROOT=Path('/var/apps').resolve()
+MAX_FILE_SIZE=10*1024*1024
+MAX_FILES_PER_APP=20000
+EXCLUDED={'.git','vendor','node_modules','storage','cache','sessions','tmp','.idea'}
+WRITABLE_EXCLUDED={'session','sessions','cache'}
+SOURCE_SUFFIXES={'.php','.phtml','.inc','.js','.ts','.py','.sh','.conf','.ini','.env.example','.yaml','.yml','.json'}
+# Linux inotify masks
+IN_MODIFY=0x00000002; IN_ATTRIB=0x00000004; IN_CLOSE_WRITE=0x00000008
+IN_MOVED_FROM=0x00000040; IN_MOVED_TO=0x00000080; IN_CREATE=0x00000100
+IN_DELETE=0x00000200; IN_DELETE_SELF=0x00000400; IN_MOVE_SELF=0x00000800
+IN_IGNORED=0x00008000; IN_Q_OVERFLOW=0x00004000; IN_ISDIR=0x40000000
+MASK=IN_CLOSE_WRITE|IN_ATTRIB|IN_MOVED_FROM|IN_MOVED_TO|IN_CREATE|IN_DELETE|IN_DELETE_SELF|IN_MOVE_SELF
+libc=ctypes.CDLL(ctypes.util.find_library('c'),use_errno=True)
+libc.inotify_init1.argtypes=[ctypes.c_int]; libc.inotify_init1.restype=ctypes.c_int
+libc.inotify_add_watch.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_uint32]; libc.inotify_add_watch.restype=ctypes.c_int
+libc.inotify_rm_watch.argtypes=[ctypes.c_int,ctypes.c_int]; libc.inotify_rm_watch.restype=ctypes.c_int
+
+def log(msg): print('[docker-php-inotify] '+str(msg),file=sys.stderr,flush=True)
+def emit(app,container,event_type,severity,message,details):
+    event={'integration':'docker-php','schema_version':'1.0','collector_version':'1.11.0',
+      'timestamp':dt.datetime.now().astimezone().isoformat(),'hostname':os.uname().nodename,
+      'application':app,'container':container,'event_source':'fim','event_type':event_type,
+      'severity':severity,'message':message,'details':details}
+    OUTPUT.parent.mkdir(parents=True,exist_ok=True)
+    with OUTPUT.open('a',encoding='utf-8') as f: f.write(json.dumps(event,ensure_ascii=False,separators=(',',':'))+'\n')
+    os.chmod(OUTPUT,0o640)
+    try: os.chown(OUTPUT,0,grp.getgrnam('wazuh').gr_gid)
+    except KeyError: pass
+
+def db_open():
+    DB.parent.mkdir(parents=True,exist_ok=True)
+    db=sqlite3.connect(DB,timeout=30)
+    db.execute('PRAGMA journal_mode=WAL'); db.execute('PRAGMA synchronous=FULL')
+    db.execute('CREATE TABLE IF NOT EXISTS fingerprints (app TEXT NOT NULL,path TEXT NOT NULL,digest TEXT NOT NULL,scope TEXT NOT NULL,container TEXT NOT NULL,PRIMARY KEY(app,path))')
+    db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+    db.commit(); os.chmod(DB,0o600)
+    return db
+
+def allowed(path,scope):
+    if path.is_symlink() or not path.is_file(): return False
+    parts={x.lower() for x in path.parts}
+    if scope=='source':
+        if parts & EXCLUDED: return False
+        return path.suffix.lower() in SOURCE_SUFFIXES or path.name.lower().endswith('.env.example')
+    return not bool(parts & WRITABLE_EXCLUDED)
+
+def digest(path):
+    try:
+        st=path.stat()
+        if st.st_size>MAX_FILE_SIZE or not path.is_file(): return None
+        h=hashlib.sha256()
+        with path.open('rb') as f:
+            for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+        return h.hexdigest()
+    except OSError: return None
+
+def load_registry():
+    apps={}
+    if not REGISTRY.is_dir(): return apps
+    for rf in sorted(REGISTRY.glob('*.json')):
+        try:
+            c=json.loads(rf.read_text(encoding='utf-8'))
+            app,container,source=c.get('application'),c.get('container'),c.get('source')
+            if not all(isinstance(x,str) and x and '\x00' not in x for x in (app,container,source)): continue
+            src=Path(source).resolve(strict=True)
+            if not src.is_dir() or not src.is_relative_to(APPS_ROOT): continue
+            roots=[(src,'source')]
+            raw=c.get('writable',[])
+            if isinstance(raw,str): raw=[raw]
+            if not isinstance(raw,list): raw=[]
+            for item in raw:
+                if not isinstance(item,str) or not item or '\x00' in item: continue
+                try:
+                    w=Path(item).resolve(strict=True)
+                    if w.is_dir() and w.is_relative_to(src.parent) and w.is_relative_to(APPS_ROOT): roots.append((w,'writable'))
+                except OSError: pass
+            # Deduplicate nested/equal roots; source remains distinct from writable.
+            unique=[]; seen=set()
+            for root,scope in roots:
+                k=(str(root),scope)
+                if k not in seen: unique.append((root,scope)); seen.add(k)
+            flags=c.get('monitoring')
+            if not isinstance(flags,dict): flags={}
+            apps[app]={'container':container,'roots':unique,'fim':flags.get('fim',True) is True}
+        except Exception as e: log(f'registry {rf} skipped: {e}')
+    return apps
+
+def walk_files(root,scope):
+    count=0
+    for current,dirs,files in os.walk(root,followlinks=False):
+        dirs[:]=[d for d in dirs if d.lower() not in (EXCLUDED if scope=='source' else WRITABLE_EXCLUDED) and not (Path(current)/d).is_symlink()]
+        for name in files:
+            p=Path(current)/name
+            if allowed(p,scope):
+                yield p
+                count+=1
+                if count>=MAX_FILES_PER_APP: return
+
+def in_scope(path,apps):
+    try: resolved=path.resolve(strict=False)
+    except OSError: return None
+    for app,cfg in apps.items():
+        if not cfg['fim']: continue
+        for root,scope in cfg['roots']:
+            try:
+                if resolved.is_relative_to(root) and allowed(resolved,scope): return app,cfg['container'],scope
+            except (OSError,ValueError): pass
+    return None
+
+def add_watch(fd,watches,path):
+    try:
+        if not path.is_dir() or path.is_symlink(): return
+        wd=libc.inotify_add_watch(fd,os.fsencode(path),MASK)
+        if wd<0:
+            err=ctypes.get_errno()
+            if err not in (2,20): log(f'cannot watch {path}: errno={err} (check fs.inotify.max_user_watches)')
+            return
+        watches[wd]=str(path)
+    except OSError as e: log(f'watch error {path}: {e}')
+
+def add_tree(fd,watches,root):
+    if not root.is_dir(): return
+    add_watch(fd,watches,root)
+    for current,dirs,_files in os.walk(root,followlinks=False):
+        dirs[:]=[d for d in dirs if d.lower() not in EXCLUDED|WRITABLE_EXCLUDED and not (Path(current)/d).is_symlink()]
+        for d in dirs: add_watch(fd,watches,Path(current)/d)
+
+def seed_legacy(db,apps):
+    # One-time migration: preserve the previous collector's SHA256 baseline.
+    if db.execute("SELECT value FROM metadata WHERE key='seeded'").fetchone(): return
+    try: state=json.loads(Path('/var/lib/defenseops/docker-php/state.json').read_text())
+    except Exception: state={}
+    legacy=state.get('files',{}) if isinstance(state,dict) else {}
+    for app,cfg in apps.items():
+        old=legacy.get(app,{})
+        if not isinstance(old,dict): old={}
+        for raw,d in old.items():
+            path=Path(raw)
+            scope=in_scope(path,apps)
+            if scope and scope[0]==app and isinstance(d,str):
+                db.execute('INSERT OR IGNORE INTO fingerprints VALUES(?,?,?,?,?)',(app,str(path),d,scope[2],cfg['container']))
+    db.execute("INSERT OR REPLACE INTO metadata VALUES('seeded','yes')"); db.commit()
+
+def baseline_new_paths(db,apps,known_roots):
+    # Baseline only newly registered roots; no alert storm for pre-existing data.
+    roots={(app,str(root),scope) for app,cfg in apps.items() if cfg['fim'] for root,scope in cfg['roots']}
+    for app,root,scope in roots-known_roots:
+        cfg=apps[app]
+        for path in walk_files(Path(root),scope):
+            d=digest(path)
+            if d: db.execute('INSERT OR IGNORE INTO fingerprints VALUES(?,?,?,?,?)',(app,str(path),d,scope,cfg['container']))
+    db.commit(); return roots
+
+def handle_file(db,apps,path):
+    match=in_scope(path,apps)
+    if match:
+        app,container,scope=match; new=digest(path)
+        if new is None: return
+        row=db.execute('SELECT digest FROM fingerprints WHERE app=? AND path=?',(app,str(path))).fetchone()
+        if row is None:
+            db.execute('INSERT OR REPLACE INTO fingerprints VALUES(?,?,?,?,?)',(app,str(path),new,scope,container)); db.commit()
+            emit(app,container,'file_added','warning','New application file detected',{'path':str(path),'scope':scope,'sha256':new})
+        elif row[0]!=new:
+            db.execute('UPDATE fingerprints SET digest=?,scope=?,container=? WHERE app=? AND path=?',(new,scope,container,app,str(path))); db.commit()
+            emit(app,container,'file_modified','high','Application file modified',{'path':str(path),'scope':scope,'old_sha256':row[0],'new_sha256':new})
+        return
+    # A delete/move-out can no longer resolve inside current roots. Match stored paths.
+    rows=db.execute('SELECT app,digest,scope,container FROM fingerprints WHERE path=?',(str(path),)).fetchall()
+    for app,old,scope,container in rows:
+        db.execute('DELETE FROM fingerprints WHERE app=? AND path=?',(app,str(path))); db.commit()
+        emit(app,container,'file_deleted','warning','Application file deleted',{'path':str(path),'scope':scope,'old_sha256':old})
+
+def main():
+    fd=libc.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC)
+    if fd<0: raise OSError(ctypes.get_errno(),'inotify_init1 failed')
+    db=db_open(); apps={}; watches={}; known_roots=set(); last_sync=0
+    try:
+        while True:
+            now=time.monotonic()
+            if now-last_sync>=60:
+                new_apps=load_registry()
+                seed_legacy(db,new_apps)
+                known_roots=baseline_new_paths(db,new_apps,known_roots)
+                apps=new_apps; watches.clear()
+                for cfg in apps.values():
+                    if cfg['fim']:
+                        for root,_scope in cfg['roots']: add_tree(fd,watches,root)
+                last_sync=now
+                log(f'registry reconciled: {len(apps)} applications, {len(watches)} directory watches')
+            ready,_,_=select.select([fd],[],[],1.0)
+            if not ready: continue
+            try: data=os.read(fd,1024*1024)
+            except BlockingIOError: continue
+            offset=0
+            while offset+16<=len(data):
+                wd,mask,cookie,nlen=struct.unpack_from('iIII',data,offset); offset+=16
+                name=data[offset:offset+nlen].split(b'\0',1)[0].decode(errors='surrogateescape'); offset+=nlen
+                if mask & IN_Q_OVERFLOW:
+                    log('inotify queue overflow; rebuilding watches from registry')
+                    last_sync=0; break
+                base=watches.get(wd)
+                if not base: continue
+                path=Path(base)/(name if name else '')
+                if mask & IN_ISDIR:
+                    if mask & (IN_CREATE|IN_MOVED_TO): add_tree(fd,watches,path)
+                    continue
+                if mask & (IN_CLOSE_WRITE|IN_ATTRIB|IN_MOVED_TO|IN_DELETE|IN_MOVED_FROM):
+                    handle_file(db,apps,path)
+    finally:
+        os.close(fd); db.close()
+
+if __name__=='__main__': main()
+PYINOTIFY
+  chown root:root "${fim_collector}.tmp.$$"
+  chmod 0750 "${fim_collector}.tmp.$$"
+  mv -f "${fim_collector}.tmp.$$" "$fim_collector"
+
+  cat > /etc/systemd/system/defenseops-docker-php-inotify.service <<'EOF'
+[Unit]
+Description=DefenseOps Docker-PHP registry-scoped inotify FIM collector
+After=local-fs.target wazuh-agent.service
+Wants=wazuh-agent.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/defenseops-docker-php-inotify.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/defenseops/docker-php /var/log/defenseops
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
   cat > /etc/systemd/system/defenseops-docker-php-collector.service <<'EOF'
 [Unit]
@@ -1246,8 +1503,11 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now defenseops-docker-php-collector.timer
-  log "Docker-PHP registry-scoped collector v1.10.3 installed (flag-controlled health/security/FIM/PHP-FPM/resource)."
-  log "Collector scope: registry applications only; Nginx logs and unrelated containers are excluded."
+  systemctl enable --now defenseops-docker-php-inotify.service
+  systemctl is-active --quiet defenseops-docker-php-inotify.service || die "Docker-PHP inotify FIM daemon failed to start."
+  log "Docker-PHP runtime collector v1.11.0 installed (health/security/PHP-FPM/resource)."
+  log "Docker-PHP FIM is handled only by the dedicated registry-scoped inotify daemon."
+  log "Wazuh Agent only ingests the JSONL event file; it does not watch application directories."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
 }
 
@@ -2821,8 +3081,8 @@ chmod 0640 "${OUT_DIR}/profiles/brebes-waf/agent.conf"
 
 cat > "${OUT_DIR}/profiles/docker-php/agent.conf" <<'PROFILE_DOCKERPHP'
 <!-- DefenseOps Docker-PHP group profile.
-     No global Docker container logs or unrelated containers are monitored.
-     Per-application paths will be registered by create-php-app.sh integration. -->
+     No native Syscheck directory monitoring is configured. The endpoint-local
+     DefenseOps inotify daemon owns registry-scoped FIM; Wazuh only ingests JSONL. -->
 <agent_config os="^Linux">
   <syscheck>
     <disabled>no</disabled>
@@ -2841,7 +3101,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.10.2
+Docker-PHP collector : v1.11.0 + inotify FIM
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -2904,7 +3164,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP collector is v1.10.3. Health and security use separate
+  The bundled Docker-PHP runtime collector is v1.11.0; the dedicated inotify FIM daemon is v1.0.0. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -2922,8 +3182,14 @@ Docker-PHP:
   symlinks are not followed. Existing files in newly added writable roots are
   baselined silently to avoid a burst of false file-added alerts. Subsequent
   changes generate JSONL events at /var/log/defenseops/docker-php-events.json.
-  Wazuh Agent reads that dedicated file as JSON. A systemd timer runs the
-  collector every five minutes. It requires Python 3 and Docker CLI access.
+  Wazuh Agent reads that dedicated file as JSON. The runtime collector timer
+  performs health/security/PHP-FPM/resource checks every five minutes. A separate
+  systemd inotify daemon recursively watches only validated registry source and
+  writable roots, hashes changed files only, and persists fingerprints in SQLite.
+  Registry reconciliation runs every 60 seconds; new roots are silently baselined.
+  Native Wazuh Syscheck does not monitor application directories, avoiding duplicate
+  FIM ownership. It requires Python 3, SQLite (standard library), Linux inotify,
+  and Docker CLI access for runtime checks.
   Missing Docker or invalid registry entries are warnings; unrelated containers
   are not added to scope. This initial implementation reports findings only;
   it does not delete, quarantine, or modify application files.
@@ -2973,7 +3239,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.10.2 + registry-scoped monitoring)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.11.0 + registry-scoped inotify FIM)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
