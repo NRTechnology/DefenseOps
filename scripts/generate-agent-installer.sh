@@ -3,8 +3,8 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.20
-# Release     : 2026-11-17
+# Version     : 1.8.21
+# Release     : 2026-11-21
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
 # Target      : Debian/Ubuntu and RHEL-compatible Linux endpoints
@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.20"
-SCRIPT_RELEASE="2026-11-19"
+SCRIPT_VERSION="1.8.21"
+SCRIPT_RELEASE="2026-11-21"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.20"
+INSTALLER_VERSION="1.8.21"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -2924,8 +2924,40 @@ if profile == "brebes-waf":
                     text[first.start():])
 
 elif profile == "docker-php":
-    # The registry-scoped collector writes this JSONL file. Keep OS Syscheck
-    # untouched; per-application FIM is performed only by the registry collector.
+    # Docker-PHP application FIM is owned exclusively by the dedicated
+    # registry-scoped inotify daemon. Remove legacy Syscheck entries under
+    # /var/apps to prevent duplicate scanning, while preserving every
+    # unrelated system directory and all other Syscheck settings.
+    removed_fim_entries = [0]
+    directories_pattern = re.compile(
+        r"<directories\b[^>]*>.*?</directories\s*>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    def remove_legacy_docker_php_fim(match):
+        element = match.group(0)
+        value = re.sub(
+            r"^.*?>|</directories\s*>$",
+            "",
+            element,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        normalized = value.rstrip("/")
+        if normalized == "/var/apps" or normalized.startswith("/var/apps/"):
+            removed_fim_entries[0] += 1
+            return ""
+        return element
+
+    text = directories_pattern.sub(remove_legacy_docker_php_fim, text)
+    if removed_fim_entries[0]:
+        print(
+            f"[INFO] Removed {removed_fim_entries[0]} legacy Syscheck "
+            "directory entr(y/ies) under /var/apps; unrelated Syscheck "
+            "directories and settings were preserved."
+        )
+    else:
+        print("[INFO] No legacy /var/apps Syscheck entries found.")
+
     docker_php_log = "/var/log/defenseops/docker-php-events.json"
     existing = set()
     for node in parsed.iter("localfile"):
