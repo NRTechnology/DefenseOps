@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.21
+# Version     : 1.8.22
 # Release     : 2026-11-21
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.21"
+SCRIPT_VERSION="1.8.22"
 SCRIPT_RELEASE="2026-11-21"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.21"
+INSTALLER_VERSION="1.8.22"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -783,12 +783,12 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP runtime collector v1.11.0."""
+"""DefenseOps Docker-PHP runtime collector v1.12.0."""
 from __future__ import annotations
 import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.11.0"
+COLLECTOR_VERSION = "1.12.0"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
@@ -1209,6 +1209,13 @@ def main():
     save_state({"collector_version":COLLECTOR_VERSION,"containers":current_containers,
                 "files":current_files,"writable_roots":current_writable_roots,
                 "updated_at":time.time()})
+
+    # Emit one heartbeat after a successful collection and state save.
+    # Health/security/FIM events remain change-driven and are not modified.
+    emit("system","defenseops-docker-php-collector","collector_status","heartbeat",
+         "info","Docker-PHP collector is active",
+         {"status":"active","applications_processed":len(current_containers),
+          "collector_version":COLLECTOR_VERSION})
     return 0
 
 if __name__=="__main__": raise SystemExit(main())
@@ -1505,7 +1512,7 @@ EOF
   systemctl enable --now defenseops-docker-php-collector.timer
   systemctl enable --now defenseops-docker-php-inotify.service
   systemctl is-active --quiet defenseops-docker-php-inotify.service || die "Docker-PHP inotify FIM daemon failed to start."
-  log "Docker-PHP runtime collector v1.11.0 installed (health/security/PHP-FPM/resource)."
+  log "Docker-PHP runtime collector v1.12.0 installed (health/security/PHP-FPM/resource)."
   log "Docker-PHP FIM is handled only by the dedicated registry-scoped inotify daemon."
   log "Wazuh Agent only ingests the JSONL event file; it does not watch application directories."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
@@ -3133,7 +3140,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.11.0 + inotify FIM
+Docker-PHP collector : v1.12.0 + inotify FIM
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -3196,7 +3203,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP runtime collector is v1.11.0; the dedicated inotify FIM daemon is v1.0.0. Health and security use separate
+  The bundled Docker-PHP runtime collector is v1.12.0; the dedicated inotify FIM daemon is v1.0.0. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -3271,7 +3278,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.11.0 + registry-scoped inotify FIM)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.12.0 + registry-scoped inotify FIM)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
