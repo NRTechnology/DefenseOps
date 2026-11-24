@@ -3,7 +3,7 @@
 # ============================================================================
 # DefenseOps - Wazuh Agent Installer Generator
 # ============================================================================
-# Version     : 1.8.23
+# Version     : 1.8.24
 # Release     : 2026-11-22
 # Execution   : Run ONLY on the DefenseOps Manager server.
 # Output      : <repository>/agent/output/ (excluded from Git)
@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.23"
+SCRIPT_VERSION="1.8.24"
 SCRIPT_RELEASE="2026-11-22"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.23"
+INSTALLER_VERSION="1.8.24"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -163,7 +163,8 @@ Options:
   -h, --help               Show help
 
 At runtime, select Brebes-WAF or Docker-PHP.
-First-time installation requests an enrollment password. Existing Agents
+A read-only pre-flight validation runs before package, Agent configuration,
+collector, inotify, or service changes. First-time installation requests an enrollment password. Existing Agents
 are never reinstalled or re-enrolled automatically. Their existing identity is
 preserved and the selected profile configuration is repaired/merged in place.
 EOF
@@ -783,15 +784,16 @@ install_docker_php_monitoring(){
 
   cat > "${collector}.tmp.$$" <<'PYDOCKERPHP'
 #!/usr/bin/env python3
-"""DefenseOps Docker-PHP runtime collector v1.13.0."""
+"""DefenseOps Docker-PHP runtime collector v1.14.0 (Docker Events + snapshots)."""
 from __future__ import annotations
-import datetime as dt, grp, hashlib, json, os, subprocess, sys, time
+import datetime as dt, grp, hashlib, json, os, subprocess, sys, time, threading, signal, select
 from pathlib import Path
 
-COLLECTOR_VERSION = "1.13.0"
+COLLECTOR_VERSION = "1.14.0"
 REGISTRY=Path("/var/lib/docker-php/monitoring/applications")
 STATE=Path("/var/lib/defenseops/docker-php/state.json")
 OUTPUT=Path("/var/log/defenseops/docker-php-events.json")
+EVENT_CURSOR=Path("/var/lib/defenseops/docker-php/docker-events.cursor")
 MAX_FILE_SIZE=10*1024*1024
 MAX_FILES_PER_APP=20000
 CPU_ALERT_PERCENT=85.0
@@ -1027,7 +1029,7 @@ def monitoring_enabled(cfg, key, default=True):
     value=flags.get(key,default)
     return value is True
 
-def main():
+def collect_once():
     state=load_state(); previous=state.get("containers",{}); previous_files=state.get("files",{})
     previous_writable_roots=state.get("writable_roots",{})
     if not isinstance(previous,dict): previous={}
@@ -1253,6 +1255,136 @@ def main():
          "info","Docker-PHP collector is active",
          {"status":"active","applications_processed":len(current_containers),
           "collector_version":COLLECTOR_VERSION})
+    return 0
+
+def event_registry():
+    """Build the event allow-list exclusively from valid Application Registry entries."""
+    result={}
+    if not REGISTRY.is_dir():
+        return result
+    for rf in sorted(REGISTRY.glob("*.json")):
+        try:
+            cfg=json.loads(rf.read_text(encoding="utf-8"))
+            app=cfg.get("application"); container=cfg.get("container")
+            if not isinstance(app,str) or not app or not isinstance(container,str) or not container:
+                continue
+            result[container]=(app,container)
+        except (OSError,ValueError,AttributeError):
+            continue
+    return result
+
+def docker_event_listener(stop_event):
+    """Stream Docker container events, emitting only events for registered containers."""
+    actions={"start","restart","die","stop","oom","destroy"}
+    try:
+        last_event_ns=int(EVENT_CURSOR.read_text(encoding="ascii").strip())
+    except (OSError,ValueError):
+        last_event_ns=0
+    last_seen=set()
+    while not stop_event.is_set():
+        allow=event_registry()
+        if not allow:
+            stop_event.wait(15)
+            continue
+        since=(str(max(0,last_event_ns/1_000_000_000-2))
+               if last_event_ns else str(max(0,int(time.time())-5)))
+        cmd=["docker","events","--since",since,"--filter","type=container","--format","{{json .}}"]
+        try:
+            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                  text=True,bufsize=1)
+        except OSError as exc:
+            print(f"[docker-php-collector] cannot start docker events: {exc}",file=sys.stderr,flush=True)
+            stop_event.wait(10)
+            continue
+        try:
+            while not stop_event.is_set():
+                if not proc.stdout:
+                    break
+                ready,_,_=select.select([proc.stdout],[],[],1.0)
+                if not ready:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                line=proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                try:
+                    event=json.loads(line)
+                except ValueError:
+                    continue
+                actor=event.get("Actor") or {}
+                attrs=actor.get("Attributes") or {}
+                container_id=event.get("id") or actor.get("ID") or ""
+                name=(attrs.get("name") or "").lstrip("/")
+                match=allow.get(name)
+                if match is None and container_id:
+                    # Resolve ID only against currently registered container names.
+                    for registered_name,(app,registered_container) in allow.items():
+                        try:
+                            inspected=docker_inspect(registered_container)
+                            if inspected and (inspected.get("Id","").startswith(container_id) or
+                                               container_id.startswith(inspected.get("Id","")[:12])):
+                                match=(app,registered_container); break
+                        except Exception:
+                            pass
+                action=str(event.get("Action") or event.get("status") or "").lower().split(":",1)[0]
+                if match is None or action not in actions:
+                    continue
+                app,container=match
+                stamp=event.get("timeNano") or event.get("time") or 0
+                try:
+                    stamp_ns=int(stamp) if int(stamp)>10**12 else int(stamp)*1_000_000_000
+                except (TypeError,ValueError):
+                    stamp_ns=0
+                dedupe=(str(container_id),action,str(stamp))
+                if dedupe in last_seen or (stamp_ns and stamp_ns<=last_event_ns):
+                    continue
+                last_seen.add(dedupe)
+                if len(last_seen)>4096:
+                    last_seen=set(list(last_seen)[-2048:])
+                severity="high" if action in ("die","oom","destroy") else "info"
+                emit(app,container,"docker_events",
+                     "container_"+("oom_killed" if action=="oom" else action),
+                     severity,"Docker container lifecycle event",
+                     {"action":action,"container_id":container_id,"container_name":name,
+                      "docker_time":event.get("time"),"docker_time_nano":event.get("timeNano"),
+                      "actor_attributes":attrs})
+                if stamp_ns:
+                    last_event_ns=max(last_event_ns,stamp_ns)
+                    EVENT_CURSOR.parent.mkdir(parents=True,exist_ok=True)
+                    tmp=EVENT_CURSOR.with_suffix(".tmp")
+                    tmp.write_text(str(last_event_ns),encoding="ascii")
+                    os.chmod(tmp,0o600)
+                    os.replace(tmp,EVENT_CURSOR)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+        if not stop_event.is_set():
+            stop_event.wait(5)
+
+def main():
+    stop_event=threading.Event()
+    def stop_handler(_signum,_frame):
+        stop_event.set()
+    signal.signal(signal.SIGTERM,stop_handler)
+    signal.signal(signal.SIGINT,stop_handler)
+    listener=threading.Thread(target=docker_event_listener,args=(stop_event,),daemon=True)
+    listener.start()
+    next_snapshot=0.0
+    while not stop_event.is_set():
+        now=time.monotonic()
+        if now>=next_snapshot:
+            try:
+                collect_once()
+            except Exception as exc:
+                print(f"[docker-php-collector] snapshot failed: {exc}",file=sys.stderr,flush=True)
+            next_snapshot=time.monotonic()+300
+        stop_event.wait(1)
     return 0
 
 if __name__=="__main__": raise SystemExit(main())
@@ -1515,41 +1647,38 @@ EOF
 
   cat > /etc/systemd/system/defenseops-docker-php-collector.service <<'EOF'
 [Unit]
-Description=DefenseOps Docker-PHP registry-scoped security collector
+Description=DefenseOps Docker-PHP registry-scoped runtime and Docker Events collector
 After=docker.service wazuh-agent.service
 Wants=docker.service
 
 [Service]
-Type=oneshot
+Type=simple
 User=root
 Group=root
-ExecStart=/usr/bin/python3 /usr/local/libexec/defenseops-docker-php-collector.py
+ExecStart=/usr/bin/python3 -u /usr/local/libexec/defenseops-docker-php-collector.py
+Restart=always
+RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
 ReadWritePaths=/var/lib/defenseops/docker-php /var/log/defenseops
-EOF
-
-  cat > /etc/systemd/system/defenseops-docker-php-collector.timer <<'EOF'
-[Unit]
-Description=Run DefenseOps Docker-PHP collector periodically
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=15sec
-Unit=defenseops-docker-php-collector.service
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
 
+  # The persistent collector now owns both Docker Events and five-minute
+  # snapshots. Disable the former timer to prevent duplicate snapshot runs.
+  systemctl disable --now defenseops-docker-php-collector.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/defenseops-docker-php-collector.timer
+
   systemctl daemon-reload
-  systemctl enable --now defenseops-docker-php-collector.timer
+  systemctl enable --now defenseops-docker-php-collector.service
   systemctl enable --now defenseops-docker-php-inotify.service
   systemctl is-active --quiet defenseops-docker-php-inotify.service || die "Docker-PHP inotify FIM daemon failed to start."
-  log "Docker-PHP runtime collector v1.13.0 installed (status snapshots + health/security/PHP-FPM/resource)."
+  systemctl is-active --quiet defenseops-docker-php-collector.service || die "Docker-PHP runtime/Docker Events collector failed to start."
+  log "Docker-PHP runtime collector v1.14.0 installed (Docker Events + five-minute snapshots + health/security/PHP-FPM/resource)."
   log "Docker-PHP FIM is handled only by the dedicated registry-scoped inotify daemon."
   log "Wazuh Agent only ingests the JSONL event file; it does not watch application directories."
   log "Runtime monitoring: PHP-FPM process/socket/workers and Docker CPU/memory/OOM/Block I/O/Network I/O."
@@ -2509,6 +2638,249 @@ activate_modsecurity_collector(){
   log "DefenseOps ModSecurity collector daemon is active and enabled at boot (inotify + internal scheduler)."
 }
 
+
+# ---------------------------------------------------------------------------
+# Read-only pre-flight validation. No package/config/service/file changes are
+# permitted before this function completes successfully.
+# ---------------------------------------------------------------------------
+preflight_check(){
+  local failures=0 warnings=0
+  pf_pass(){ printf '[PASS] %s\n' "$*"; }
+  pf_warn(){ printf '[WARN] %s\n' "$*"; warnings=$((warnings+1)); }
+  pf_fail(){ printf '[FAIL] %s\n' "$*" >&2; failures=$((failures+1)); }
+
+  echo
+  echo "DefenseOps Agent Installer v${INSTALLER_VERSION}"
+  echo "Pre-flight validation: ${ENDPOINT_PROFILE}"
+  echo "------------------------------------------------------------"
+
+  [[ $EUID -eq 0 ]] && pf_pass "Root privileges" || pf_fail "Root privileges required"
+  [[ -r /etc/os-release ]] && pf_pass "OS identification file" || pf_fail "/etc/os-release unavailable"
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    case "${ID:-}" in
+      ubuntu|debian|linuxmint|pop|rhel|rocky|almalinux|centos|ol|fedora|amzn)
+        pf_pass "Supported distribution: ${PRETTY_NAME:-$ID}" ;;
+      *)
+        pf_fail "Unsupported distribution: ${ID:-unknown}" ;;
+    esac
+  fi
+  command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1 &&
+    pf_pass "systemd available" || pf_fail "systemd unavailable"
+  command -v python3 >/dev/null 2>&1 && pf_pass "Python 3 available" || pf_fail "Python 3 unavailable"
+  command -v curl >/dev/null 2>&1 && pf_pass "curl available" || pf_fail "curl unavailable"
+  command -v getent >/dev/null 2>&1 && pf_pass "getent available" || pf_fail "getent unavailable"
+  command -v timeout >/dev/null 2>&1 && pf_pass "timeout utility available" || pf_fail "timeout utility unavailable"
+  command -v df >/dev/null 2>&1 && pf_pass "Disk inspection utility available" || pf_fail "df unavailable"
+
+  if command -v df >/dev/null 2>&1; then
+    local free_kb
+    free_kb="$(df -Pk /var 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb >= 102400 )); then
+      pf_pass "Free space on /var: ${free_kb} KiB"
+    else
+      pf_fail "At least 100 MiB free space is required on /var"
+    fi
+  fi
+
+  [[ -r "$CONFIG_FILE" && -s "$CONFIG_FILE" ]] &&
+    pf_pass "Generated ossec.conf is readable" || pf_fail "Generated ossec.conf missing/empty: $CONFIG_FILE"
+  if [[ -r "$CONFIG_FILE" ]]; then
+    if python3 - "$CONFIG_FILE" <<'PFPY'
+import sys, xml.etree.ElementTree as ET
+try:
+    ET.parse(sys.argv[1])
+except Exception as exc:
+    print(f"[FAIL] Generated ossec.conf XML invalid: {exc}")
+    raise SystemExit(1)
+print("[PASS] Generated ossec.conf XML valid")
+PFPY
+    then :; else failures=$((failures+1)); fi
+  fi
+
+  if (( AGENT_PACKAGE_INSTALLED == 1 )); then
+    [[ -x /var/ossec/bin/wazuh-agentd ]] &&
+      pf_pass "Existing Wazuh Agent binary" || pf_fail "Wazuh Agent package detected but daemon binary missing"
+    [[ -s /var/ossec/etc/ossec.conf ]] &&
+      pf_pass "Existing Agent configuration present" || pf_fail "Existing Agent ossec.conf missing/empty"
+    if [[ -e /var/ossec/etc/client.keys ]]; then
+      if (( AGENT_ENROLLED == 1 )); then
+        pf_pass "Existing enrollment identity detected (will be preserved)"
+      elif [[ ! -s /var/ossec/etc/client.keys ]]; then
+        pf_pass "Empty client.keys placeholder (not enrolled)"
+      else
+        pf_fail "client.keys is non-empty but contains no valid enrollment entry"
+      fi
+    else
+      pf_pass "No existing client.keys (first enrollment path)"
+    fi
+  else
+    pf_pass "Wazuh Agent package not installed; first-install path"
+    if [[ -e /var/ossec/etc/client.keys && -s /var/ossec/etc/client.keys ]]; then
+      pf_fail "Orphan non-empty client.keys exists without a detected Agent package"
+    fi
+  fi
+
+  if [[ -n "$MANAGER" ]]; then
+    if getent ahosts "$MANAGER" >/dev/null 2>&1; then
+      pf_pass "Manager address resolves: $MANAGER"
+    else
+      pf_fail "Manager address cannot be resolved: $MANAGER"
+    fi
+    if timeout 4 bash -c ':</dev/tcp/$1/$2' _ "$MANAGER" "$MANAGER_PORT" >/dev/null 2>&1; then
+      pf_pass "Manager TCP ${MANAGER_PORT} reachable"
+    else
+      pf_fail "Manager TCP ${MANAGER_PORT} is not reachable"
+    fi
+    if (( AGENT_ENROLLED == 0 )); then
+      if timeout 4 bash -c ':</dev/tcp/$1/$2' _ "$MANAGER" "$REG_PORT" >/dev/null 2>&1; then
+        pf_pass "Enrollment TCP ${REG_PORT} reachable"
+      else
+        pf_fail "Enrollment TCP ${REG_PORT} is not reachable"
+      fi
+    else
+      pf_pass "Enrollment port check skipped for already-enrolled Agent"
+    fi
+  fi
+
+  if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]]; then
+    command -v nginx >/dev/null 2>&1 && pf_pass "Nginx command available" || pf_fail "Nginx command unavailable"
+    [[ -s "$NGINX_DUMP" && -s "$DISCOVERY_REPORT" ]] &&
+      pf_pass "Nginx configuration discovery completed" || pf_fail "Nginx discovery artifacts missing"
+    ((${#NGINX_ACCESS_LOGS[@]} > 0)) &&
+      pf_pass "Verified JSON access logs: ${#NGINX_ACCESS_LOGS[@]}" || pf_fail "No verified JSON access logs"
+  elif [[ "$ENDPOINT_PROFILE" == "docker-php" ]]; then
+    command -v docker >/dev/null 2>&1 && pf_pass "Docker CLI available" || pf_fail "Docker CLI required for Docker-PHP profile"
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      pf_pass "Docker Engine accessible"
+    else
+      pf_fail "Docker Engine unavailable or current user cannot access it"
+    fi
+    local registry="/var/lib/docker-php/monitoring/applications"
+    if [[ -d "$registry" && -r "$registry" && -x "$registry" ]]; then
+      pf_pass "Application Registry directory available"
+    else
+      pf_fail "Application Registry directory missing or unreadable: $registry"
+    fi
+    if [[ -d "$registry" ]]; then
+      if python3 - "$registry" <<'PFREG'
+import json, os, sys
+from pathlib import Path
+
+registry=Path(sys.argv[1])
+files=sorted(registry.glob("*.json"))
+errors=[]
+warnings=[]
+seen_apps={}
+seen_containers={}
+apps_root=Path("/var/apps").resolve()
+
+if not files:
+    warnings.append("Registry contains no *.json application entries; collector will wait for registrations")
+
+for rf in files:
+    try:
+        cfg=json.loads(rf.read_text(encoding="utf-8"))
+        if not isinstance(cfg,dict):
+            raise ValueError("root must be a JSON object")
+        app=cfg.get("application")
+        container=cfg.get("container")
+        source=cfg.get("source")
+        if not isinstance(app,str) or not app.strip() or not isinstance(container,str) or not container.strip():
+            raise ValueError("application and container must be non-empty strings")
+        if not isinstance(source,str) or not source.startswith("/"):
+            raise ValueError("source must be an absolute path")
+        if app in seen_apps:
+            raise ValueError(f"duplicate application name also used by {seen_apps[app]}")
+        if container in seen_containers:
+            raise ValueError(f"container name already registered by {seen_containers[container]}")
+        seen_apps[app]=rf.name; seen_containers[container]=rf.name
+
+        src=Path(source).resolve(strict=True)
+        if not src.is_dir() or not src.is_relative_to(apps_root):
+            raise ValueError(f"source path unavailable or outside /var/apps: {source}")
+
+        if "writable" not in cfg:
+            raise ValueError("required field writable is missing")
+        raw=cfg["writable"]
+        if isinstance(raw,str):
+            writable=[raw]
+        elif isinstance(raw,list):
+            writable=raw
+        else:
+            raise ValueError("writable must be an absolute path string or an array of absolute paths (null is invalid)")
+        for item in writable:
+            if not isinstance(item,str) or not item.startswith("/") or "\x00" in item:
+                raise ValueError(f"invalid writable path entry: {item!r}")
+            w=Path(item).resolve(strict=True)
+            if not w.is_dir() or not w.is_relative_to(src.parent) or not w.is_relative_to(apps_root):
+                raise ValueError(f"writable path unavailable or outside application root: {item}")
+
+        flags=cfg.get("monitoring",{})
+        if not isinstance(flags,dict):
+            raise ValueError("monitoring must be a JSON object when specified")
+        for key in ("fim","docker_health","security","php_fpm"):
+            if key in flags and not isinstance(flags[key],bool):
+                raise ValueError(f"monitoring.{key} must be boolean")
+        if flags.get("malware") is True:
+            warnings.append(f"{rf.name}: monitoring.malware=true is unsupported; no malware scan will run")
+
+        compose=cfg.get("compose")
+        if compose not in (None,""):
+            if not isinstance(compose,str) or not compose.startswith("/"):
+                raise ValueError("compose must be an absolute path when specified")
+            if not Path(compose).is_file():
+                raise ValueError(f"Compose file does not exist: {compose}")
+
+        if not os.access(rf,os.R_OK):
+            raise ValueError("registry file is not readable")
+        print(f"[PASS] Registry {rf.name}: schema, source, writable, monitoring flags")
+        # A registered container may legitimately be stopped at install time.
+        import subprocess
+        p=subprocess.run(["docker","inspect",container],stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        if p.returncode:
+            warnings.append(f"{app}: registered container '{container}' is not currently inspectable")
+    except Exception as exc:
+        errors.append(f"{rf.name}: {exc}")
+
+for item in warnings:
+    print(f"[WARN] {item}")
+for item in errors:
+    print(f"[FAIL] {item}")
+print(f"[INFO] Registry entries checked: {len(files)}")
+raise SystemExit(1 if errors else 0)
+PFREG
+      then
+        pf_pass "All registry entries passed validation"
+      else
+        pf_fail "One or more registry entries are invalid"
+      fi
+    fi
+    if python3 - <<'PFMODULE'
+import ctypes, ctypes.util, json, sqlite3
+assert ctypes.util.find_library("c"), "libc not found"
+sqlite3.connect(":memory:").close()
+json.loads('{"preflight":true}')
+print("[PASS] Python ctypes, SQLite and JSON modules available")
+PFMODULE
+    then :; else pf_fail "Required Python modules/libc are unavailable"; fi
+  fi
+
+  echo "------------------------------------------------------------"
+  if (( failures > 0 )); then
+    printf '[FAIL] Pre-flight result: %s failure(s), %s warning(s)\n' "$failures" "$warnings" >&2
+    die "Installation cancelled. No package, Agent configuration, collector, inotify, or service changes have been made."
+  fi
+  printf '[PASS] Pre-flight result: READY (%s warning(s))\n' "$warnings"
+  echo
+  read -r -p "All required checks passed. Continue installation? [y/N] " proceed
+  case "${proceed,,}" in
+    y|yes) log "Pre-flight accepted; installation may proceed." ;;
+    *) die "Installation cancelled by operator. No installation changes were made." ;;
+  esac
+}
+
 # Docker-PHP application scope comes exclusively from the prepared Application Registry.
 # No Compose discovery and no broad /var/apps paths are injected into native Syscheck.
 DOCKER_PHP_APP_DIRS_FILE=""
@@ -2522,7 +2894,11 @@ else
   log "Application scope will be read exclusively from the Docker-PHP Application Registry."
 fi
 
-# Stage the parser only after local ModSecurity discovery has succeeded.
+# All read-only checks must pass before staging collectors, changing time settings,
+# installing packages, enrolling, or modifying the active Agent configuration.
+preflight_check
+
+# Stage the parser only after local ModSecurity discovery and pre-flight validation.
 # Collector daemon activation is deferred until the Wazuh configuration has been validated.
 if [[ "$ENDPOINT_PROFILE" == "brebes-waf" ]] && (( MODSEC_COLLECTOR_ENABLED == 1 )); then
   stage_modsecurity_collector
@@ -3177,7 +3553,7 @@ cat > "${OUT_DIR}/README.txt" <<EOF
 DefenseOps Agent Deployment - Brebes-WAF & Docker-PHP
 ====================================================
 Generator    : v${SCRIPT_VERSION} (${SCRIPT_RELEASE})
-Docker-PHP collector : v1.13.0 + inotify FIM + status snapshots
+Docker-PHP collector : v1.14.0 + Docker Events + snapshots + inotify FIM
 Wazuh Agent  : ${VERSION}
 Manager      : ${MANAGER}
 Agent port   : ${MANAGER_PORT}/TCP
@@ -3240,7 +3616,7 @@ Docker-PHP:
   installer installs a registry-scoped collector which reads only
   /var/lib/docker-php/monitoring/applications/*.json. It never enumerates all
   Docker containers as monitoring targets and does not collect Nginx logs.
-  The bundled Docker-PHP runtime collector is v1.13.0; the dedicated inotify FIM daemon is v1.0.0. Health and security use separate
+  The bundled Docker-PHP runtime collector is v1.14.0; it streams Docker container lifecycle events and performs five-minute status snapshots. The dedicated inotify FIM daemon is v1.0.0. Health and security use separate
   fingerprints. PHP-FPM root detection counts only process command lines beginning with
   "php-fpm: pool ". The master process and inspection shell are excluded.
   A verified pool worker running as UID 0 is reported as root_user. If no
@@ -3258,8 +3634,9 @@ Docker-PHP:
   symlinks are not followed. Existing files in newly added writable roots are
   baselined silently to avoid a burst of false file-added alerts. Subsequent
   changes generate JSONL events at /var/log/defenseops/docker-php-events.json.
-  Wazuh Agent reads that dedicated file as JSON. The runtime collector timer
-  performs health/security/PHP-FPM/resource checks every five minutes. A separate
+  Wazuh Agent reads that dedicated file as JSON. The persistent runtime collector
+  streams Docker Events for registered containers and performs health/security/
+  PHP-FPM/resource snapshots every five minutes. A separate
   systemd inotify daemon recursively watches only validated registry source and
   writable roots, hashes changed files only, and persists fingerprints in SQLite.
   Registry reconciliation runs every 60 seconds; new roots are silently baselined.
@@ -3315,7 +3692,7 @@ log "Deployment bundle generated:"
 printf '  Output  : %s\n' "$OUT_DIR"
 printf '  Archive : %s\n' "$ARCHIVE_PATH"
 printf '  SHA256  : %s\n' "$CHECKSUM_PATH"
-log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.13.0 + status snapshots + registry-scoped inotify FIM)."
+log "Profiles: brebes-waf -> Brebes-WAF (unchanged); docker-php -> docker-php (collector v1.14.0 + Docker Events + five-minute snapshots + registry-scoped inotify FIM)."
 log "Existing enrolled Agents are preserved; Manager-side group membership is not changed."
 log "Brebes-WAF Concurrent/Serial ModSecurity audit normalization is integrated in the endpoint installer."
 log "No enrollment secret was copied or embedded."
