@@ -16,8 +16,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.24"
-SCRIPT_RELEASE="2026-11-22"
+SCRIPT_VERSION="1.8.25"
+SCRIPT_RELEASE="2026-11-24"
 VERSION="4.14.10"
 MANAGER_PORT="1514"
 REG_PORT="1515"
@@ -137,7 +137,7 @@ cat > "${OUT_DIR}/install-agent.sh" <<'INSTALLER'
 set -Eeuo pipefail
 
 WAZUH_AGENT_VERSION="4.14.10"
-INSTALLER_VERSION="1.8.24"
+INSTALLER_VERSION="1.8.25"
 MANAGER=""
 REG_PORT="1515"
 MANAGER_PORT="1514"
@@ -2800,15 +2800,18 @@ for rf in files:
         if not src.is_dir() or not src.is_relative_to(apps_root):
             raise ValueError(f"source path unavailable or outside /var/apps: {source}")
 
-        if "writable" not in cfg:
-            raise ValueError("required field writable is missing")
-        raw=cfg["writable"]
-        if isinstance(raw,str):
+        # writable is optional: null, an empty string, or [] means that
+        # the application has no additional writable directory to monitor.
+        # This matches both Docker-PHP runtime collector and inotify FIM.
+        raw=cfg.get("writable", [])
+        if raw is None or raw == "":
+            writable=[]
+        elif isinstance(raw,str):
             writable=[raw]
         elif isinstance(raw,list):
             writable=raw
         else:
-            raise ValueError("writable must be an absolute path string or an array of absolute paths (null is invalid)")
+            raise ValueError("writable must be null, an absolute path string, or an array of absolute paths")
         for item in writable:
             if not isinstance(item,str) or not item.startswith("/") or "\x00" in item:
                 raise ValueError(f"invalid writable path entry: {item!r}")
